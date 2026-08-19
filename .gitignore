@@ -2,6 +2,12 @@
 dist/
 build/
 *.spec
+artifacts/
+artifacts_v2/
+
+# 本地私人文件（保持本地，不推送 GitHub）
+MEMORY.md
+gpt.md
 
 # 运行时数据（程序运行产生的本地文件不上传）
 data/
