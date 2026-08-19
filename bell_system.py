@@ -38,6 +38,10 @@ except ImportError:
 # 路径配置
 # ============================================================
 APP_DIR = Path(__file__).parent.resolve()
+# 重要：onefile 打包后 __file__ 指向临时解压目录(_MEIxxxxx)，数据会随程序退出丢失。
+# 必须用 exe 所在目录作数据根目录，保证配置/数据库/日志持久化（绿色免安装版）。
+if getattr(sys, 'frozen', False):
+    APP_DIR = Path(sys.executable).resolve().parent
 DATA_DIR = APP_DIR / "data"
 LOG_DIR = APP_DIR / "logs"
 CONFIG_DIR = APP_DIR / "config"
@@ -321,6 +325,7 @@ class Scheduler:
         self._next_time = None
         self._next_dt = None
         self._next_task_name = None
+        self._next_task_id = None
         self._listeners = []
 
     def add_listener(self, fn):
@@ -456,6 +461,7 @@ class Scheduler:
         # 更新显示信息（精确到具体时刻，供界面计算真实距离）
         self._next_dt = next_time
         self._next_task_name = next_task["name"] if next_task else ""
+        self._next_task_id = next_task["id"] if next_task else None
         self._next_time = next_time.strftime("%H:%M:%S")
         self._notify("next_time", time=self._next_time, dt=next_time, name=self._next_task_name)
 
@@ -475,10 +481,17 @@ class Scheduler:
             waited += 1
             if waited % 5 == 0:
                 now2 = datetime.datetime.now()
+                # 距目标时间 <=6秒时不重算：此时重算会把到点的 daily 任务推到明天，
+                # 返回的下一个任务 id 变化导致误判 REPLAN，白等一轮（用户遇到的核心 bug）
+                if self._next_dt and (self._next_dt - now2).total_seconds() <= 6:
+                    continue
                 schedules2 = self.db.get_schedules(self.db.get_active_profile_id())
                 nt2, task2 = self._calculate_next(now2, schedules2)
-                if task2 is not None and nt2 != self._next_dt:
-                    return  # 计划有变化，重新调度
+                if task2 is not None:
+                    # 同一任务（id相同）只是时间滚动到第二天，不触发 REPLAN
+                    same_task = task2["id"] == self._next_task_id
+                    if nt2 != self._next_dt and not same_task:
+                        return  # 计划有变化，重新调度
 
         if not self._running or self._pause:
             return
