@@ -1,0 +1,25 @@
+# 构建产物
+dist/
+build/
+*.spec
+
+# 运行时数据（程序运行产生的本地文件不上传）
+data/
+logs/
+config/
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 系统
+Thumbs.db
+.DS_Store
+
+# 本地临时
+*.tmp
+*_play_temp_*
