@@ -39,6 +39,9 @@ import webbrowser
 # V2.0 Web 远程控制（纯标准库实现，见 web_server.py）
 from web_server import BellWebServer
 
+# Windows 下子进程（ffmpeg 转码 / powercfg 等）不弹出黑色控制台窗口
+SUBPROCESS_FLAGS = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+
 # ============================================================
 # 路径配置
 # ============================================================
@@ -359,7 +362,8 @@ class AudioPlayer:
         try:
             subprocess.run(
                 [str(ffmpeg_path), "-y", "-i", src, "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "2", dst],
-                capture_output=True, timeout=30
+                capture_output=True, timeout=30,
+                creationflags=SUBPROCESS_FLAGS
             )
             return Path(dst).exists()
         except Exception as e:
@@ -1603,11 +1607,14 @@ class SettingsDialog:
         """阻止系统休眠"""
         try:
             if enable:
-                subprocess.run(["powercfg", "-change", "-standby-timeout-ac", "0"], capture_output=True)
-                subprocess.run(["powercfg", "-change", "-hibernate-timeout-ac", "0"], capture_output=True)
+                subprocess.run(["powercfg", "-change", "-standby-timeout-ac", "0"],
+                               capture_output=True, creationflags=SUBPROCESS_FLAGS)
+                subprocess.run(["powercfg", "-change", "-hibernate-timeout-ac", "0"],
+                               capture_output=True, creationflags=SUBPROCESS_FLAGS)
             else:
                 # 恢复默认 30分钟
-                subprocess.run(["powercfg", "-change", "-standby-timeout-ac", "30"], capture_output=True)
+                subprocess.run(["powercfg", "-change", "-standby-timeout-ac", "30"],
+                               capture_output=True, creationflags=SUBPROCESS_FLAGS)
         except Exception as e:
             logger.warning(f"设置电源策略失败: {e}")
 
