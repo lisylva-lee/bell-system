@@ -382,6 +382,8 @@ class Scheduler:
         self._next_task_name = None
         self._next_task_id = None
         self._listeners = []
+        # V2.0.1: 数据被 GUI/Web 修改后置位，等待循环立即中断并重新规划
+        self._resync = threading.Event()
 
     def add_listener(self, fn):
         self._listeners.append(fn)
@@ -404,6 +406,10 @@ class Scheduler:
     def stop(self):
         self._running = False
         logger.info("定时引擎已停止")
+
+    def reschedule(self):
+        """数据变化后调用：打断当前等待循环，立即重新计算下一次任务"""
+        self._resync.set()
 
     def pause(self):
         self._pause = True
@@ -505,6 +511,7 @@ class Scheduler:
 
     def _schedule_round(self):
         """单个调度回合：计算下一次、更新显示、等待、到点执行"""
+        self._resync.clear()
         now = datetime.datetime.now()
         active_profile = self.db.get_active_profile_id()
         schedules = self.db.get_schedules(active_profile)
@@ -512,12 +519,15 @@ class Scheduler:
         next_time, next_task = self._calculate_next(now, schedules)
 
         if next_time is None:
-            # 没有任务：清空显示，30秒后再检查
+            # 没有任务：清空显示，分段睡眠以便及时响应新增任务/暂停
             self._next_dt = None
             self._next_task_name = None
             self._next_time = None
             self._notify("no_schedule")
-            time.sleep(30)
+            for _ in range(30):
+                if not self._running or self._resync.is_set():
+                    break
+                time.sleep(1)
             return
 
         # 更新显示信息（精确到具体时刻，供界面计算真实距离）
@@ -541,6 +551,9 @@ class Scheduler:
                 continue
             time.sleep(1)
             waited += 1
+            if self._resync.is_set():
+                self._resync.clear()
+                return  # 数据已变化，重新规划
             if waited % 5 == 0:
                 now2 = datetime.datetime.now()
                 # 距目标时间 <=6秒时不重算：此时重算会把到点的 daily 任务推到明天，
@@ -837,7 +850,7 @@ class BellApp:
                     values = self._tree.item(item, "values")
                     enabled = values[0] == "☐"
                     self.db.toggle_schedule(int(item), enabled)
-                    self._refresh_display()
+                    self._after_task_change()
 
     def _update_clock(self):
         """更新时钟显示"""
@@ -893,9 +906,17 @@ class BellApp:
             self._next_date_label.config(text="")
             self._next_dist_label.config(text="暂无任务")
 
+    def _after_task_change(self):
+        """任务/方案数据变化后的统一收尾：刷新界面 + 定时引擎立即重排"""
+        self._refresh_display()
+        try:
+            self.scheduler.reschedule()
+        except Exception:
+            pass
+
     # ---- 任务操作 ----
     def _add_schedule(self):
-        ScheduleDialog(self.root, self.db, self._refresh_display)
+        ScheduleDialog(self.root, self.db, self._after_task_change)
 
     def _edit_schedule(self):
         selected = self._tree.selection()
@@ -905,7 +926,7 @@ class BellApp:
         sid = int(selected[0])
         row = self.db.conn.execute("SELECT * FROM schedules WHERE id=?", (sid,)).fetchone()
         if row:
-            ScheduleDialog(self.root, self.db, self._refresh_display, row)
+            ScheduleDialog(self.root, self.db, self._after_task_change, row)
 
     def _delete_schedule(self):
         selected = self._tree.selection()
@@ -915,7 +936,7 @@ class BellApp:
         if messagebox.askyesno("确认", "确定要删除选中的任务吗？"):
             for item in selected:
                 self.db.delete_schedule(int(item))
-            self._refresh_display()
+            self._after_task_change()
 
     def _play_selected(self):
         """试听选中任务的铃声"""
@@ -959,11 +980,11 @@ class BellApp:
         for p in profiles:
             if p["name"] == name:
                 self.db.activate_profile(p["id"])
-                self._refresh_display()
+                self._after_task_change()
                 break
 
     def _manage_profiles(self):
-        ProfileDialog(self.root, self.db, self._refresh_display)
+        ProfileDialog(self.root, self.db, self._after_task_change)
 
     # ---- 暂停 ----
     def _toggle_pause(self):

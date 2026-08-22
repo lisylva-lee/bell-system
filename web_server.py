@@ -181,6 +181,13 @@ class ApiHandler(BaseHTTPRequestHandler):
             return {}
 
     def _changed(self):
+        # 数据变化：先打断调度器当前等待（立即重新规划），再通知 GUI 刷新
+        sched = self.ctx.get("scheduler")
+        if sched:
+            try:
+                sched.reschedule()
+            except Exception:
+                pass
         cb = self.ctx.get("on_change")
         if cb:
             try:
@@ -621,211 +628,298 @@ details summary{cursor:pointer;font-size:15px;font-weight:700}
 let TOKEN = localStorage.getItem('bell_token') || '';
 let SCHEDULES = [], NEXT = null, NEXT_LEFT = 0, LAST_TICK = Date.now();
 
-const $ = id => document.getElementById(id);
-const WEEK = ['一','二','三','四','五','六','日'];
-const TYPE_TXT = {daily:'每天', weekly:'每周', date:'指定日期', once:'一次性'};
+var $ = function(id){ return document.getElementById(id); };
+var WEEK = ['一','二','三','四','五','六','日'];
+var TYPE_TXT = {daily:'每天', weekly:'每周', date:'指定日期', once:'一次性'};
 
 function toast(msg, ms){
   ms = ms || 2200;
-  const t = $('toast'); t.textContent = msg; t.style.display='block';
-  clearTimeout(t._h); t._h = setTimeout(function(){t.style.display='none';}, ms);
-}
-
-async function api(path, opts, tries){
-  opts = opts || {}; tries = tries || 0;
-  const sep = path.indexOf('?') >= 0 ? '&' : '?';
-  const url = TOKEN ? path + sep + 'token=' + encodeURIComponent(TOKEN) : path;
-  let r;
-  try { r = await fetch(url, Object.assign({headers:{'Content-Type':'application/json'}}, opts)); }
-  catch(e){ setConn(false); throw new Error('网络错误'); }
-  if(r.status === 401){
-    if(tries >= 2) throw new Error('令牌错误');
-    const t = prompt('请输入访问令牌 (Token)') || '';
-    TOKEN = t; localStorage.setItem('bell_token', t);
-    return api(path, opts, tries+1);
-  }
-  setConn(true);
-  const j = await r.json();
-  if(!j.ok) throw new Error(j.error || '请求失败');
-  return j;
+  var t = $('toast');
+  t.textContent = msg;
+  t.style.display = 'block';
+  clearTimeout(t._h);
+  t._h = setTimeout(function(){ t.style.display = 'none'; }, ms);
 }
 
 function setConn(ok){
-  const c = $('conn');
+  var c = $('conn');
   c.textContent = ok ? '● 已连接' : '● 连接断开，自动重试中…';
   c.className = ok ? '' : 'bad';
 }
 
-function esc(s){ const d=document.createElement('div'); d.textContent=(s==null?'':s); return d.innerHTML; }
+function esc(s){
+  var d = document.createElement('div');
+  d.textContent = (s === null || s === undefined) ? '' : String(s);
+  return d.innerHTML;
+}
+
+function qs(path){
+  return TOKEN ? path + (path.indexOf('?') >= 0 ? '&' : '?') + 'token=' + encodeURIComponent(TOKEN) : path;
+}
+
+function api(path, opts, tries){
+  opts = opts || {};
+  tries = tries || 0;
+  return fetch(qs(path), Object.assign({headers:{'Content-Type':'application/json'}}, opts))
+    .then(function(r){
+      if (r.status === 401) {
+        if (tries >= 2) throw new Error('令牌错误');
+        var t = prompt('请输入访问令牌 (Token)') || '';
+        TOKEN = t;
+        localStorage.setItem('bell_token', t);
+        return api(path, opts, tries + 1);
+      }
+      setConn(true);
+      return r.json();
+    })
+    .then(function(j){
+      if (!j || !j.ok) throw new Error((j && j.error) || '请求失败');
+      return j;
+    })
+    .catch(function(e){
+      if (e && e.message === 'Failed to fetch') { setConn(false); throw new Error('网络错误'); }
+      throw e;
+    });
+}
 
 // ---------- 状态 ----------
-async function pollStatus(){
-  try{
-    const j = await api('/api/status');
-    const s = j.status;
+function pollStatus(){
+  return api('/api/status').then(function(j){
+    var s = j.status;
     $('clock').textContent = s.now.slice(11);
     $('pauseBtn').textContent = s.paused ? '▶ 恢复打铃' : '⏸ 暂停打铃';
-    NEXT = s.next; NEXT_LEFT = s.next ? s.next.in_seconds : 0; LAST_TICK = Date.now();
+    NEXT = s.next;
+    NEXT_LEFT = s.next ? s.next.in_seconds : 0;
+    LAST_TICK = Date.now();
     renderNext();
     renderProfiles(s.active_profile);
-  }catch(e){ /* 连接状态已在 api() 中更新 */ }
+  }).catch(function(){});
 }
 
 function renderNext(){
-  if(!NEXT){ $('nextTime').textContent='暂无任务'; $('nextDist').textContent=''; return; }
-  const left = Math.max(0, NEXT_LEFT - Math.floor((Date.now()-LAST_TICK)/1000));
+  if (!NEXT) {
+    $('nextTime').textContent = '暂无任务';
+    $('nextDist').textContent = '';
+    return;
+  }
+  var left = Math.max(0, NEXT_LEFT - Math.floor((Date.now() - LAST_TICK) / 1000));
   $('nextTime').textContent = '下一次：' + NEXT.time + ' · ' + NEXT.name;
-  const h=Math.floor(left/3600), m=Math.floor(left%3600/60), sec=left%60;
-  $('nextDist').textContent = '距离 ' + (h>0? h+' 时 ':'') + m+' 分 '+sec+' 秒';
+  var h = Math.floor(left / 3600);
+  var m = Math.floor(left % 3600 / 60);
+  var sec = left % 60;
+  $('nextDist').textContent = '距离 ' + (h > 0 ? h + ' 时 ' : '') + m + ' 分 ' + sec + ' 秒';
 }
 
 // ---------- 方案 ----------
-let PROFILES = [];
+var PROFILES = [];
+function loadProfiles(){
+  return api('/api/profiles').then(function(j){ PROFILES = j.profiles; }).catch(function(){});
+}
 function renderProfiles(active){
-  const sel = $('profileSel');
-  sel.innerHTML = PROFILES.map(function(p){
-    return '<option value="'+p.id+'"'+(active && p.id===active.id?' selected':'')+'>'+esc(p.name)+(p.is_active?' ✓':'')+'</option>';
-  }).join('');
+  var html = '';
+  for (var i = 0; i < PROFILES.length; i++) {
+    var p = PROFILES[i];
+    var sel = (active && p.id === active.id) ? ' selected' : '';
+    html += '<option value="' + p.id + '"' + sel + '>' + esc(p.name) + (p.is_active ? ' ✓' : '') + '</option>';
+  }
+  $('profileSel').innerHTML = html;
 }
-async function loadProfiles(){
-  try{ const j = await api('/api/profiles'); PROFILES = j.profiles; }catch(e){}
-}
-async function switchProfile(id){
-  try{ await api('/api/profiles/activate', {method:'POST', body:JSON.stringify({id:+id})});
-    toast('已切换方案'); loadSchedules(); }
-  catch(e){ toast(e.message); pollStatus(); }
+function switchProfile(id){
+  api('/api/profiles/activate', {method:'POST', body:JSON.stringify({id:+id})})
+    .then(function(j){ toast('已切换方案'); loadProfiles(); loadSchedules(); })
+    .catch(function(e){ toast(e.message); pollStatus(); });
 }
 
 // ---------- 任务 ----------
-async function loadSchedules(){
-  try{
-    const j = await api('/api/schedules'); SCHEDULES = j.schedules;
-    $('audioList').innerHTML = [...new Set(SCHEDULES.map(function(s){return s.audio_file;}))]
-      .map(function(f){ return '<option value="'+esc(f)+'">'; }).join('');
-    const box = $('taskList');
-    if(!SCHEDULES.length){ box.innerHTML = '<div class="empty">暂无任务，点击下方按钮添加</div>'; return; }
-    box.innerHTML = SCHEDULES.map(function(s){
-      const meta = [TYPE_TXT[s.schedule_type] || s.schedule_type];
-      if(s.schedule_type==='weekly' && s.week_days.length)
-        meta.push('周' + s.week_days.map(function(d){return WEEK[d];}).join('、'));
-      if((s.schedule_type==='date'||s.schedule_type==='once') && s.date_str) meta.push(s.date_str);
+function loadSchedules(){
+  return api('/api/schedules').then(function(j){
+    SCHEDULES = j.schedules;
+    var files = [];
+    for (var k = 0; k < SCHEDULES.length; k++) {
+      if (files.indexOf(SCHEDULES[k].audio_file) < 0) files.push(SCHEDULES[k].audio_file);
+    }
+    var dl = '';
+    for (var k2 = 0; k2 < files.length; k2++) dl += '<option value="' + esc(files[k2]) + '">';
+    $('audioList').innerHTML = dl;
+
+    var box = $('taskList');
+    if (!SCHEDULES.length) {
+      box.innerHTML = '<div class="empty">暂无任务，点击下方按钮添加</div>';
+      return;
+    }
+    var html = '';
+    for (var i = 0; i < SCHEDULES.length; i++) {
+      var s = SCHEDULES[i];
+      var meta = [TYPE_TXT[s.schedule_type] || s.schedule_type];
+      if (s.schedule_type === 'weekly' && s.week_days.length) {
+        var names = [];
+        for (var d = 0; d < s.week_days.length; d++) names.push(WEEK[s.week_days[d]]);
+        meta.push('周' + names.join('、'));
+      }
+      if ((s.schedule_type === 'date' || s.schedule_type === 'once') && s.date_str) meta.push(s.date_str);
       meta.push(s.volume + '%');
-      return '<div class="task'+(s.enabled?'':' off')+'">'
-        +'<label class="switch"><input type="checkbox"'+(s.enabled?' checked':'')+' onchange="toggleTask('+s.id+',this.checked)"><span class="slider"></span></label>'
-        +'<div class="info" onclick="openEditor('+s.id+')">'
-        +'<div class="t">'+s.time_str.slice(0,5)+'</div>'
-        +'<div class="n">'+esc(s.name)+'</div>'
-        +'<div class="m">'+meta.map(esc).join(' · ')+'</div></div>'
-        +'<button class="iconbtn" title="播放" onclick="ringOne('+s.id+')">▶</button>'
-        +'<button class="iconbtn" title="编辑" onclick="openEditor('+s.id+')">✏️</button>'
-        +'<button class="iconbtn" title="删除" onclick="delTask('+s.id+')">🗑</button>'
-        +'</div>';
-    }).join('');
-  }catch(e){ $('taskList').innerHTML = '<div class="empty">'+esc(e.message)+'</div>'; }
+      html += '<div class="task' + (s.enabled ? '' : ' off') + '">'
+        + '<label class="switch"><input type="checkbox"' + (s.enabled ? ' checked' : '') + ' onchange="toggleTask(' + s.id + ',this.checked)"><span class="slider"></span></label>'
+        + '<div class="info" onclick="openEditor(' + s.id + ')">'
+        + '<div class="t">' + esc(s.time_str.slice(0,5)) + '</div>'
+        + '<div class="n">' + esc(s.name) + '</div>'
+        + '<div class="m">' + esc(meta.join(' · ')) + '</div></div>'
+        + '<button class="iconbtn" title="播放" onclick="ringOne(' + s.id + ')">▶</button>'
+        + '<button class="iconbtn" title="编辑" onclick="openEditor(' + s.id + ')">✏️</button>'
+        + '<button class="iconbtn" title="删除" onclick="delTask(' + s.id + ')">🗑</button>'
+        + '</div>';
+    }
+    box.innerHTML = html;
+  }).catch(function(e){
+    $('taskList').innerHTML = '<div class="empty">' + esc(e.message) + '</div>';
+  });
 }
 
-async function toggleTask(id, enabled){
-  try{ await api('/api/schedules/toggle', {method:'POST', body:JSON.stringify({id:id, enabled:enabled})}); }
-  catch(e){ toast(e.message); }
+function findTask(id){
+  for (var i = 0; i < SCHEDULES.length; i++) if (SCHEDULES[i].id === id) return SCHEDULES[i];
+  return null;
+}
+
+function toggleTask(id, enabled){
+  api('/api/schedules/toggle', {method:'POST', body:JSON.stringify({id:id, enabled:enabled})})
+    .catch(function(e){ toast(e.message); });
   loadSchedules();
 }
-async function delTask(id){
-  const s = SCHEDULES.find(function(x){return x.id===id;});
-  if(!confirm('确定删除任务「'+(s?s.name:id)+'」吗？')) return;
-  try{ await api('/api/schedules/delete', {method:'POST', body:JSON.stringify({id:id})}); toast('已删除'); }
-  catch(e){ toast(e.message); }
+function delTask(id){
+  var s = findTask(id);
+  if (!confirm('确定删除任务「' + (s ? s.name : id) + '」吗？')) return;
+  api('/api/schedules/delete', {method:'POST', body:JSON.stringify({id:id})})
+    .then(function(){ toast('已删除'); })
+    .catch(function(e){ toast(e.message); });
   loadSchedules();
 }
-async function ringOne(id){
-  try{ const j = await api('/api/ring', {method:'POST', body:JSON.stringify({schedule_id:id})}); toast(j.message||'播放中'); }
-  catch(e){ toast(e.message); }
+function ringOne(id){
+  api('/api/ring', {method:'POST', body:JSON.stringify({schedule_id:id})})
+    .then(function(j){ toast(j.message || '播放中'); })
+    .catch(function(e){ toast(e.message); });
 }
-async function ringAll(){
-  try{ const j = await api('/api/ring', {method:'POST', body:'{}'}); toast(j.message||'播放中'); }
-  catch(e){ toast(e.message); }
+function ringAll(){
+  api('/api/ring', {method:'POST', body:'{}'})
+    .then(function(j){ toast(j.message || '播放中'); })
+    .catch(function(e){ toast(e.message); });
 }
-async function stopPlay(){
-  try{ await api('/api/stop', {method:'POST', body:'{}'}); toast('已停止'); }
-  catch(e){ toast(e.message); }
+function stopPlay(){
+  api('/api/stop', {method:'POST', body:'{}'})
+    .then(function(){ toast('已停止'); })
+    .catch(function(e){ toast(e.message); });
 }
-async function togglePause(){
-  try{ const j = await api('/api/pause', {method:'POST', body:'{}'});
-    $('pauseBtn').textContent = j.paused ? '▶ 恢复打铃' : '⏸ 暂停打铃';
-    toast(j.paused ? '已暂停打铃' : '已恢复打铃'); }
-  catch(e){ toast(e.message); }
+function togglePause(){
+  api('/api/pause', {method:'POST', body:'{}'})
+    .then(function(j){
+      $('pauseBtn').textContent = j.paused ? '▶ 恢复打铃' : '⏸ 暂停打铃';
+      toast(j.paused ? '已暂停打铃' : '已恢复打铃');
+    })
+    .catch(function(e){ toast(e.message); });
 }
 
 // ---------- 编辑弹窗 ----------
 function buildWeeks(){
-  $('f_weeks').innerHTML = WEEK.map(function(w,i){
-    return '<label><input type="checkbox" value="'+i+'"'+(i<5?' checked':'')+'><span>'+w+'</span></label>';
-  }).join('');
+  var html = '';
+  for (var i = 0; i < WEEK.length; i++) {
+    html += '<label><input type="checkbox" value="' + i + '"' + (i < 5 ? ' checked' : '') + '><span>' + WEEK[i] + '</span></label>';
+  }
+  $('f_weeks').innerHTML = html;
+}
+function setTypeRadio(v){
+  var radios = document.querySelectorAll('input[name=stype]');
+  for (var i = 0; i < radios.length; i++) radios[i].checked = (radios[i].value === v);
+}
+function getType(){
+  var radios = document.querySelectorAll('input[name=stype]');
+  for (var i = 0; i < radios.length; i++) if (radios[i].checked) return radios[i].value;
+  return 'weekly';
 }
 function typeChanged(){
-  const t = document.querySelector('input[name=stype]:checked').value;
-  $('weekField').style.display = t==='weekly' ? '' : 'none';
-  $('dateField').style.display = (t==='date'||t==='once') ? '' : 'none';
+  var t = getType();
+  $('weekField').style.display = (t === 'weekly') ? '' : 'none';
+  $('dateField').style.display = (t === 'date' || t === 'once') ? '' : 'none';
 }
 function openEditor(id){
-  const s = id ? SCHEDULES.find(function(x){return x.id===id;}) : null;
+  // 每次打开都重建星期复选框，杜绝残留勾选状态
+  buildWeeks();
+  var s = id ? findTask(id) : null;
   $('modalTitle').textContent = s ? '编辑任务' : '添加任务';
   $('f_id').value = s ? s.id : '';
   $('f_name').value = s ? s.name : '';
-  document.querySelector('input[name=stype][value="'+(s?s.schedule_type:'weekly')+'"]').checked = true;
-  document.querySelectorAll('#f_weeks input').forEach(function(cb){
-    cb.checked = s && s.schedule_type==='weekly' ? s.week_days.indexOf(+cb.value)>=0 : (+cb.value)<5;
-  });
+  setTypeRadio(s ? s.schedule_type : 'weekly');
+  var boxes = document.querySelectorAll('#f_weeks input');
+  for (var i = 0; i < boxes.length; i++) {
+    var v = +boxes[i].value;
+    if (s && s.schedule_type === 'weekly') {
+      boxes[i].checked = s.week_days.indexOf(v) >= 0;
+    } else {
+      boxes[i].checked = v < 5;
+    }
+  }
   $('f_date').value = s ? s.date_str : '';
   $('f_time').value = s ? s.time_str.slice(0,5) : '08:00';
   $('f_audio').value = s ? s.audio_file : '';
-  $('f_vol').value = s ? s.volume : 80; $('f_volOut').value = s ? s.volume : 80;
+  $('f_vol').value = s ? s.volume : 80;
+  $('f_volOut').value = s ? s.volume : 80;
   $('f_enabled').checked = s ? !!s.enabled : true;
   typeChanged();
   $('modal').classList.add('show');
 }
 function closeEditor(){ $('modal').classList.remove('show'); }
-async function saveTask(){
-  const type = document.querySelector('input[name=stype]:checked').value;
-  const payload = {
-    id: $('f_id').value ? +$('f_id').value : undefined,
+function saveTask(){
+  var type = getType();
+  var boxes = document.querySelectorAll('#f_weeks input:checked');
+  var days = [];
+  for (var i = 0; i < boxes.length; i++) days.push(+boxes[i].value);
+  var payload = {
     name: $('f_name').value.trim(),
     schedule_type: type,
     time_str: $('f_time').value,
-    week_days: [...document.querySelectorAll('#f_weeks input:checked')].map(function(cb){return +cb.value;}),
+    week_days: days,
     date_str: $('f_date').value,
     audio_file: $('f_audio').value.trim(),
     volume: +$('f_vol').value,
-    enabled: $('f_enabled').checked,
+    enabled: $('f_enabled').checked
   };
-  if(!payload.name) return toast('请输入任务名称');
-  if(!payload.audio_file) return toast('请填写铃声文件路径');
-  if(type==='weekly' && !payload.week_days.length) return toast('请至少选择一个星期');
-  if((type==='date'||type==='once') && !payload.date_str) return toast('请选择日期');
-  try{
-    await api(payload.id ? '/api/schedules/update' : '/api/schedules/create',
-      {method:'POST', body:JSON.stringify(payload)});
-    toast('已保存'); closeEditor(); loadSchedules();
-  }catch(e){ toast(e.message); }
+  var fid = $('f_id').value;
+  if (fid) payload.id = +fid;
+  if (!payload.name) { toast('请输入任务名称'); return; }
+  if (!payload.audio_file) { toast('请填写铃声文件路径'); return; }
+  if (type === 'weekly' && !payload.week_days.length) { toast('请至少选择一个星期'); return; }
+  if ((type === 'date' || type === 'once') && !payload.date_str) { toast('请选择日期'); return; }
+  var url = fid ? '/api/schedules/update' : '/api/schedules/create';
+  api(url, {method:'POST', body:JSON.stringify(payload)})
+    .then(function(){ toast('已保存'); closeEditor(); loadSchedules(); })
+    .catch(function(e){ toast(e.message); });
+}
 
 // ---------- 日志 ----------
-async function loadLogs(){
-  try{
-    const j = await api('/api/logs?limit=100');
-    const box = $('logList');
-    if(!j.logs.length){ box.innerHTML='<div class="empty">暂无日志</div>'; return; }
-    box.innerHTML = j.logs.map(function(l){
-      return '<div class="log '+(l.status==='success'?'ok':'bad')+'">'
-        +'<span class="lt">'+esc(l.time||'')+'</span>'
-        +'<span class="ln">'+esc(l.name||'')+'（'+esc(l.audio||'')+'）</span>'
-        +'<span class="ls">'+(l.status==='success'?'✅ 成功':'❌ '+esc(l.error||'失败'))+'</span></div>';
-    }).join('');
-  }catch(e){ $('logList').innerHTML = '<div class="empty">'+esc(e.message)+'</div>'; }
+function loadLogs(){
+  return api('/api/logs?limit=100').then(function(j){
+    var box = $('logList');
+    if (!j.logs.length) { box.innerHTML = '<div class="empty">暂无日志</div>'; return; }
+    var html = '';
+    for (var i = 0; i < j.logs.length; i++) {
+      var l = j.logs[i];
+      var cls = l.status === 'success' ? 'ok' : 'bad';
+      var st = l.status === 'success' ? '✅ 成功' : '❌ ' + esc(l.error || '失败');
+      html += '<div class="log ' + cls + '">'
+        + '<span class="lt">' + esc(l.time || '') + '</span>'
+        + '<span class="ln">' + esc(l.name || '') + '（' + esc(l.audio || '') + '）</span>'
+        + '<span class="ls">' + st + '</span></div>';
+    }
+    box.innerHTML = html;
+  }).catch(function(e){
+    $('logList').innerHTML = '<div class="empty">' + esc(e.message) + '</div>';
+  });
 }
 
 // ---------- 启动 ----------
 buildWeeks();
-loadProfiles().then(loadSchedules);
-pollStatus(); loadLogs();
+loadProfiles();
+loadSchedules();
+pollStatus();
+loadLogs();
 setInterval(renderNext, 1000);
 setInterval(pollStatus, 2000);
 setInterval(loadSchedules, 15000);
