@@ -15,6 +15,7 @@ import threading
 import datetime
 import subprocess
 import logging
+import queue
 from pathlib import Path
 from typing import Optional, List, Tuple
 
@@ -33,6 +34,10 @@ try:
     from PIL import Image, ImageDraw
 except ImportError:
     pystray = None
+
+import webbrowser
+# V2.0 Web 远程控制（纯标准库实现，见 web_server.py）
+from web_server import BellWebServer
 
 # ============================================================
 # 路径配置
@@ -55,6 +60,35 @@ CONFIG_PATH = CONFIG_DIR / "settings.json"
 LOG_FILE = LOG_DIR / f"bell_{datetime.date.today().isoformat()}.log"
 
 # ============================================================
+# 全局设置读写（V2.0 起供 GUI 与 Web 共用）
+# ============================================================
+DEFAULT_SETTINGS = {
+    "auto_start": False,
+    "prevent_sleep": False,
+    "minimize_to_tray": True,
+    # V2.0 Web 远程控制
+    "web_enabled": False,
+    "web_port": 8787,
+    "web_token": "",
+}
+
+
+def load_settings() -> dict:
+    data = dict(DEFAULT_SETTINGS)
+    if CONFIG_PATH.exists():
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                data.update(json.load(f))
+        except Exception:
+            pass
+    return data
+
+
+def save_settings(settings: dict):
+    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+        json.dump(settings, f, ensure_ascii=False, indent=2)
+
+# ============================================================
 # 日志
 # ============================================================
 logging.basicConfig(
@@ -73,8 +107,15 @@ logger = logging.getLogger("BellSystem")
 class Database:
     def __init__(self, db_path: Path):
         self.db_path = db_path
+        # V2.0: Web 服务线程与 GUI/调度线程并发访问，写操作需加锁保证事务原子；
+        # WAL 模式允许读写并行，降低 "database is locked" 概率
+        self.lock = threading.RLock()
         self.conn = sqlite3.connect(str(db_path), check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
+        try:
+            self.conn.execute("PRAGMA journal_mode=WAL")
+        except sqlite3.DatabaseError:
+            pass
         self._init_db()
 
     def _init_db(self):
@@ -132,6 +173,10 @@ class Database:
         return self.conn.execute("SELECT * FROM schedules ORDER BY time_str").fetchall()
 
     def add_schedule(self, data: dict) -> int:
+        with self.lock:
+            return self._add_schedule_impl(data)
+
+    def _add_schedule_impl(self, data: dict) -> int:
         c = self.conn.cursor()
         c.execute("""
             INSERT INTO schedules (name, schedule_type, time_str, week_days, date_str, audio_file, volume, play_count, enabled, profile_id)
@@ -147,6 +192,10 @@ class Database:
         return c.lastrowid
 
     def update_schedule(self, sid: int, data: dict):
+        with self.lock:
+            self._update_schedule_impl(sid, data)
+
+    def _update_schedule_impl(self, sid: int, data: dict):
         self.conn.execute("""
             UPDATE schedules SET name=?, schedule_type=?, time_str=?, week_days=?, date_str=?,
             audio_file=?, volume=?, play_count=?, enabled=?, profile_id=?
@@ -161,32 +210,37 @@ class Database:
         self.conn.commit()
 
     def delete_schedule(self, sid: int):
-        self.conn.execute("DELETE FROM schedules WHERE id=?", (sid,))
-        self.conn.commit()
+        with self.lock:
+            self.conn.execute("DELETE FROM schedules WHERE id=?", (sid,))
+            self.conn.commit()
 
     def toggle_schedule(self, sid: int, enabled: bool):
-        self.conn.execute("UPDATE schedules SET enabled=? WHERE id=?", (1 if enabled else 0, sid))
-        self.conn.commit()
+        with self.lock:
+            self.conn.execute("UPDATE schedules SET enabled=? WHERE id=?", (1 if enabled else 0, sid))
+            self.conn.commit()
 
     # 方案
     def get_profiles(self) -> List[sqlite3.Row]:
         return self.conn.execute("SELECT * FROM profiles ORDER BY id").fetchall()
 
     def add_profile(self, name: str) -> int:
-        c = self.conn.cursor()
-        c.execute("INSERT INTO profiles (name) VALUES (?)", (name,))
-        self.conn.commit()
-        return c.lastrowid
+        with self.lock:
+            c = self.conn.cursor()
+            c.execute("INSERT INTO profiles (name) VALUES (?)", (name,))
+            self.conn.commit()
+            return c.lastrowid
 
     def delete_profile(self, pid: int):
-        self.conn.execute("DELETE FROM profiles WHERE id=?", (pid,))
-        self.conn.execute("UPDATE schedules SET profile_id=0 WHERE profile_id=?", (pid,))
-        self.conn.commit()
+        with self.lock:
+            self.conn.execute("DELETE FROM profiles WHERE id=?", (pid,))
+            self.conn.execute("UPDATE schedules SET profile_id=0 WHERE profile_id=?", (pid,))
+            self.conn.commit()
 
     def activate_profile(self, pid: int):
-        self.conn.execute("UPDATE profiles SET is_active=0")
-        self.conn.execute("UPDATE profiles SET is_active=1 WHERE id=?", (pid,))
-        self.conn.commit()
+        with self.lock:
+            self.conn.execute("UPDATE profiles SET is_active=0")
+            self.conn.execute("UPDATE profiles SET is_active=1 WHERE id=?", (pid,))
+            self.conn.commit()
 
     def get_active_profile_id(self) -> int:
         r = self.conn.execute("SELECT id FROM profiles WHERE is_active=1").fetchone()
@@ -194,11 +248,12 @@ class Database:
 
     # 日志
     def add_log(self, schedule_id: int, name: str, audio: str, status: str = "success", error: str = ""):
-        self.conn.execute("""
-            INSERT INTO logs (schedule_id, schedule_name, audio_file, execute_time, status, error_message)
-            VALUES (?, ?, ?, datetime('now','localtime'), ?, ?)
-        """, (schedule_id, name, audio, status, error))
-        self.conn.commit()
+        with self.lock:
+            self.conn.execute("""
+                INSERT INTO logs (schedule_id, schedule_name, audio_file, execute_time, status, error_message)
+                VALUES (?, ?, ?, datetime('now','localtime'), ?, ?)
+            """, (schedule_id, name, audio, status, error))
+            self.conn.commit()
 
     def get_logs(self, limit: int = 100) -> List[sqlite3.Row]:
         return self.conn.execute(
@@ -377,7 +432,14 @@ class Scheduler:
             if not s["enabled"]:
                 continue
 
-            h, m, sec = map(int, s["time_str"].split(":"))
+            # 容错 HH:MM / HH:MM:SS（手工改库或旧数据可能缺秒）
+            try:
+                parts = [int(x) for x in str(s["time_str"]).split(":")]
+            except ValueError:
+                continue
+            while len(parts) < 3:
+                parts.append(0)
+            h, m, sec = parts[0], parts[1], parts[2]
             stype = s["schedule_type"]
 
             if stype == "daily":
@@ -568,6 +630,25 @@ class BellApp:
         self._tray = None
         self._setup_tray()
 
+        # V2.0 Web 远程控制服务
+        # 注意：Web 线程禁止直接调 Tk；用队列投递，主线程定时排空后刷新
+        self._web_events = queue.Queue()
+        self._web = None
+        self._start_web_server()
+        self.root.after(300, self._drain_web_events)
+
+    def _drain_web_events(self):
+        changed = False
+        try:
+            while True:
+                self._web_events.get_nowait()
+                changed = True
+        except queue.Empty:
+            pass
+        if changed:
+            self._refresh_display()
+        self.root.after(400, self._drain_web_events)
+
     def _build_ui(self):
         """构建界面"""
         root = self.root
@@ -576,6 +657,14 @@ class BellApp:
         header = tk.Frame(root, bg=self.accent_color, height=50)
         header.pack(fill=tk.X)
         header.pack_propagate(False)
+
+        # 底部状态栏（先于中部扩展区域声明，保证占住底边）
+        status_bar = tk.Frame(root, bg="#e8eaed")
+        status_bar.pack(side=tk.BOTTOM, fill=tk.X)
+        self._web_label = tk.Label(status_bar, text="", bg="#e8eaed", fg="#555",
+                                   font=("微软雅黑", 9), cursor="hand2")
+        self._web_label.pack(side=tk.RIGHT, padx=10, pady=3)
+        self._web_label.bind("<Button-1>", lambda e: self._open_web_ui())
 
         tk.Label(header, text="🔔 智能打铃系统", font=("微软雅黑", 16, "bold"),
                  bg=self.accent_color, fg="white").pack(side=tk.LEFT, padx=15, pady=8)
@@ -889,9 +978,65 @@ class BellApp:
     def _show_logs(self):
         LogDialog(self.root, self.db)
 
+    # ---- Web 远程控制 (V2.0) ----
+    def _start_web_server(self, show_error=False):
+        settings = load_settings()
+        if not settings.get("web_enabled"):
+            self._update_web_label(None)
+            return
+        try:
+            self._web = BellWebServer(
+                self.db, self.player, self.scheduler,
+                port=int(settings.get("web_port") or 8787),
+                token=str(settings.get("web_token") or ""),
+                on_change=lambda: self._web_events.put(1))
+            self._web.start()
+            urls = self._web.get_urls()
+            logger.info("🌐 远程控制地址: %s", " , ".join(urls))
+            self._update_web_label(urls[0])
+            if show_error and urls:
+                messagebox.showinfo(
+                    "远程控制已启动",
+                    "同一局域网内的手机/电脑用浏览器打开：\n\n" + "\n".join(urls),
+                    parent=self.root)
+        except OSError as e:
+            self._web = None
+            logger.error("Web 服务启动失败: %s", e)
+            self._update_web_label(None)
+            if show_error:
+                messagebox.showerror(
+                    "远程控制启动失败",
+                    f"端口被占用或无权限：{e}\n可在系统设置中更换端口。",
+                    parent=self.root)
+
+    def _stop_web_server(self):
+        if self._web:
+            self._web.stop()
+            self._web = None
+        self._update_web_label(None)
+
+    def _restart_web_server(self, show_error=False):
+        self._stop_web_server()
+        self._start_web_server(show_error=show_error)
+
+    def _open_web_ui(self):
+        if self._web and self._web.is_running:
+            urls = self._web.get_urls()
+            if urls:
+                webbrowser.open(urls[-1])  # 优先 127.0.0.1
+
+    def _update_web_label(self, url):
+        try:
+            self._web_label.config(text=f"🌐 远程控制: {url}" if url else "")
+        except Exception:
+            pass
+
     # ---- 系统设置 ----
     def _system_settings(self):
-        SettingsDialog(self.root)
+        dlg = SettingsDialog(self.root)
+        if getattr(dlg, "saved", False):
+            # 设置变化后立即生效（含端口/令牌/开关）；启用时弹窗展示访问地址
+            self._restart_web_server(show_error=True)
 
     # ---- 系统托盘 ----
     def _setup_tray(self):
@@ -919,6 +1064,8 @@ class BellApp:
             pystray.MenuItem("立即打铃", lambda: self._immediate_ring()),
             pystray.MenuItem("暂停打铃", lambda: self.scheduler.pause()),
             pystray.MenuItem("恢复打铃", lambda: self.scheduler.resume()),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("打开网页控制台", lambda: self._open_web_ui()),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("退出", on_quit),
         )
@@ -1312,11 +1459,12 @@ class LogDialog:
 # ============================================================
 class SettingsDialog:
     def __init__(self, parent):
+        self.saved = False  # V2.0: BellApp 据此判断需要重启 Web 服务
         self.settings = self._load_settings()
 
         self.dialog = tk.Toplevel(parent)
         self.dialog.title("系统设置")
-        self.dialog.geometry("380x280")
+        self.dialog.geometry("420x500")
         self.dialog.resizable(False, False)
         self.dialog.transient(parent)
         self.dialog.grab_set()
@@ -1325,23 +1473,10 @@ class SettingsDialog:
         self.dialog.wait_window()
 
     def _load_settings(self) -> dict:
-        defaults = {
-            "auto_start": False,
-            "prevent_sleep": False,
-            "minimize_to_tray": True,
-        }
-        if CONFIG_PATH.exists():
-            try:
-                with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    defaults.update(data)
-            except:
-                pass
-        return defaults
+        return load_settings()
 
     def _save_settings(self):
-        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-            json.dump(self.settings, f, ensure_ascii=False, indent=2)
+        save_settings(self.settings)
 
     def _build_ui(self):
         d = self.dialog
@@ -1362,6 +1497,31 @@ class SettingsDialog:
                              font=("微软雅黑", 10))
         cb3.pack(anchor=tk.W, padx=20, pady=5)
 
+        # ---- 🌐 Web 远程控制 (V2.0) ----
+        tk.Label(d, text="🌐 Web 远程控制", font=("微软雅黑", 10, "bold"),
+                 fg="#2196F3").pack(anchor=tk.W, padx=20, pady=(16, 2))
+
+        self._web_enabled_var = tk.BooleanVar(value=self.settings.get("web_enabled", False))
+        tk.Checkbutton(d, text="启用局域网网页远程控制（手机/其他电脑可操作）",
+                       variable=self._web_enabled_var,
+                       font=("微软雅黑", 10)).pack(anchor=tk.W, padx=20, pady=2)
+
+        port_row = tk.Frame(d)
+        port_row.pack(anchor=tk.W, padx=20, pady=2)
+        tk.Label(port_row, text="端口:", font=("微软雅黑", 10)).pack(side=tk.LEFT)
+        self._web_port_var = tk.StringVar(value=str(self.settings.get("web_port", 8787)))
+        tk.Entry(port_row, textvariable=self._web_port_var, width=7,
+                 font=("微软雅黑", 10), justify=tk.CENTER).pack(side=tk.LEFT, padx=6)
+
+        token_row = tk.Frame(d)
+        token_row.pack(anchor=tk.W, padx=20, pady=2)
+        tk.Label(token_row, text="访问令牌:", font=("微软雅黑", 10)).pack(side=tk.LEFT)
+        self._web_token_var = tk.StringVar(value=str(self.settings.get("web_token", "")))
+        tk.Entry(token_row, textvariable=self._web_token_var, width=16,
+                 font=("微软雅黑", 10), show="•").pack(side=tk.LEFT, padx=6)
+        tk.Label(d, text="令牌留空不加密；设置后打开网页需输入一次", fg="#999",
+                 font=("微软雅黑", 8)).pack(anchor=tk.W, padx=20)
+
         tk.Label(d, text="", font=("微软雅黑", 10)).pack(pady=10)
 
         tk.Button(d, text="保存设置", font=("微软雅黑", 10), width=12,
@@ -1373,6 +1533,13 @@ class SettingsDialog:
         self.settings["auto_start"] = self._auto_start_var.get()
         self.settings["prevent_sleep"] = self._prevent_sleep_var.get()
         self.settings["minimize_to_tray"] = self._minimize_tray_var.get()
+        self.settings["web_enabled"] = bool(self._web_enabled_var.get())
+        try:
+            self.settings["web_port"] = max(1, min(65535, int(self._web_port_var.get() or 8787)))
+        except ValueError:
+            self.settings["web_port"] = 8787
+        self.settings["web_token"] = self._web_token_var.get().strip()
+        self.saved = True
         self._save_settings()
 
         # 设置开机自启
@@ -1444,6 +1611,7 @@ def main():
     app.run()
 
     # 关闭
+    app._stop_web_server()
     scheduler.stop()
     db.close()
     logger.info("程序退出")
