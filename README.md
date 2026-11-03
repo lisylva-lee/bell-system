@@ -3,7 +3,19 @@
 > Windows 7/10/11 通用的本地定时打铃软件 — 不依赖服务器、不依赖网络，绿色免安装。
 
 **GitHub 仓库**: https://github.com/lisylva-lee/bell-system
-（push 到 `main` 分支自动触发 Actions 双架构编译，产物在 Actions Artifacts 下载）
+
+## 📦 下载（不用自己编译）
+
+到 **Releases** 页面直接下载现成的 exe：
+
+| 文件 | 适用系统 | 下载 |
+|---|---|---|
+| `BellSystem_x64.exe` | Windows 10 / 11（64 位） | [下载](../../releases/latest/download/BellSystem_x64.exe) |
+| `BellSystem_Win7_x86.exe` | Windows 7（32/64 位通用） | [下载](../../releases/latest/download/BellSystem_Win7_x86.exe) |
+
+> 上面的链接指向滚动发布 [`latest`](../../releases/tag/latest)，每次 push 到 `main` 都会自动重新编译并覆盖；
+> 带版本号的发布（如 [`v2.3`](../../releases/tag/v2.3)）则固定不变，适合长期留存。
+> 全部发布页：<https://github.com/lisylva-lee/bell-system/releases>
 
 ## 项目结构
 
