@@ -118,6 +118,15 @@ pyinstaller --onefile --windowed --icon=bell.ico --name="BellSystem" \
 
 ## 版本历史
 
+### v2.3.1 (2026-11-03) — 实机测试发现的问题修复
+- 🐛 修复：**同一程序被启动两次时每次打铃响两遍**（两个调度线程各自打一次）→ 新增 Windows 命名互斥**单实例锁**，
+  第二个实例会尝试唤醒已有窗口，失败则弹提示后退出（互斥名带 exe 目录哈希，不同目录的两套程序互不影响）
+- 🐛 修复：**Windows 下两个实例能同时绑定同一个 Web 端口**（SO_REUSEADDR 在 Windows 允许抢占绑定），
+  导致「端口被占用」提示永不触发 → 改为关闭 SO_REUSEADDR 并显式 `SO_EXCLUSIVEADDRUSE`
+- 🐛 修复：Web 接口 `version` 写死为 `2.1` → 改为跟随程序版本
+- ⚡ 优化：ffmpeg 只探测一次并缓存，无 ffmpeg 时不再每次打铃都重试转码、也不再刷 WARNING
+- ✅ 实机端到端测试 9/9 通过（真实 exe + 真实 MP3 + 真实 Web 接口，含强杀后 WAL 完整性校验）
+
 ### v2.3 (2026-11-03) — 结构重构与工程化（**功能与数据行为不变**）
 - 🧱 分层重构：拆为 `bellapp/`（paths / settings / logsetup / storage / player / scheduler /
   csvio / power / ui / web / app），入口 `bell_system.py` 与 `web_server.py` 保留为薄壳，旧 `import` 用法不受影响

@@ -60,6 +60,14 @@ def test_epoch_semantics():
     assert not p.is_cancelled(p.current_epoch())
 
 
+def test_ffmpeg_probe_is_cached():
+    """ffmpeg 只探测一次（旧实现每次播放都重试并刷 WARNING）"""
+    from bellapp.player import ffmpeg_path
+    first = ffmpeg_path()
+    assert isinstance(first, str)
+    assert ffmpeg_path() is first, "应返回缓存结果（同一个对象）"
+
+
 def test_no_legacy_stop_flag_left():
     src = (ROOT / "bellapp" / "player.py").read_text(encoding="utf-8")
     assert "self._stop_flag" not in src

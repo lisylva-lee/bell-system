@@ -3,6 +3,7 @@
 import logging
 
 from . import __version__
+from . import single_instance
 from .paths import DB_PATH
 from .logsetup import setup_logging
 from .settings import load_settings
@@ -17,6 +18,13 @@ def main():
     logger = setup_logging()
     logger.info("=" * 50)
     logger.info("🔔 智能打铃系统启动 (v%s)", __version__)
+
+    # V2.3.1: 单实例保护 —— 双开会让两个调度线程各打一次铃（实机测试已复现）
+    if not single_instance.acquire():
+        if not single_instance.focus_existing():
+            single_instance.notify_already_running()
+        logger.warning("程序已在运行，本次启动退出")
+        return 0
 
     db = Database(DB_PATH)
     try:
@@ -51,6 +59,7 @@ def main():
             db.close()
         except Exception:
             pass
+        single_instance.release()
         logger.info("程序退出")
 
 

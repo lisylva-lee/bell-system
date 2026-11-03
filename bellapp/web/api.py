@@ -14,10 +14,12 @@ from urllib.parse import urlsplit, parse_qs
 from pathlib import Path
 
 from .ui import INDEX_HTML
+from .. import __version__
 
 logger = logging.getLogger("BellSystem.Web")
 
-WEB_VERSION = "2.1"
+# V2.3.1: 接口版本跟随程序版本（旧实现写死 2.1，升级后接口仍报 2.1）
+WEB_VERSION = __version__
 
 
 ALLOWED_AUDIO_EXT = {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac"}
@@ -566,15 +568,28 @@ class ApiHandler(BaseHTTPRequestHandler):
 
 
 class BoundedThreadingHTTPServer(ThreadingHTTPServer):
-    """限制并发请求数的 ThreadingHTTPServer（防止局域网设备刷爆线程）"""
+    """限制并发请求数的 ThreadingHTTPServer（防止局域网设备刷爆线程）
+
+    V2.3.1: Windows 上 SO_REUSEADDR 的语义与 Linux 不同 —— 它允许**另一个进程抢占绑定**
+    同一个端口（实机测试中两个实例都成功绑定了 8787，导致"端口被占用"的提示永不触发）。
+    因此 Windows 下关闭 SO_REUSEADDR 并显式设置 SO_EXCLUSIVEADDRUSE，让第二个实例直接失败。
+    """
 
     daemon_threads = True
-    allow_reuse_address = True
+    allow_reuse_address = os.name != "nt"
 
     def __init__(self, server_address, handler,
                  max_workers: int = MAX_CONCURRENT_REQUESTS):
         self._slots = threading.BoundedSemaphore(max_workers)
         ThreadingHTTPServer.__init__(self, server_address, handler)
+
+    def server_bind(self):
+        if os.name == "nt":
+            try:
+                self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            except (AttributeError, OSError):
+                pass
+        ThreadingHTTPServer.server_bind(self)
 
     def process_request(self, request, client_address):
         if not self._slots.acquire(False):

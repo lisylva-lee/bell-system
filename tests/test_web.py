@@ -134,6 +134,32 @@ def test_token_header_only_and_rate_limited():
         s.close()
 
 
+def test_web_version_follows_package_version():
+    """接口版本必须跟随程序版本（旧实现写死 2.1）"""
+    from bellapp import __version__
+    assert W.WEB_VERSION == __version__, (W.WEB_VERSION, __version__)
+
+
+def test_port_cannot_be_bound_twice():
+    """同一端口不能被第二个实例抢占绑定（Windows 上 SO_REUSEADDR 语义会允许，必须独占）"""
+    s = Server("")
+    try:
+        from http.server import BaseHTTPRequestHandler
+
+        class H(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+        try:
+            W.BoundedThreadingHTTPServer(("0.0.0.0", s.port), H)
+        except OSError:
+            pass                                   # 期望：端口被占用，绑定失败
+        else:
+            raise AssertionError("同一端口被重复绑定成功，说明没有独占绑定")
+    finally:
+        s.close()
+
+
 def test_error_not_leaked_and_alerts():
     s = Server("")
     try:

@@ -3,6 +3,7 @@
 import os
 import re
 import time
+import shutil
 import hashlib
 import threading
 import subprocess
@@ -19,6 +20,35 @@ except ImportError:
     pygame = None
 
 logger = logging.getLogger("BellSystem.Player")
+
+_UNSET = object()
+_FFMPEG_CACHE = _UNSET
+
+
+def ffmpeg_path() -> str:
+    """探测一次 ffmpeg 并缓存结果；找不到时返回空串。
+
+    旧实现每次播放都重新拼路径并起一次 subprocess，无 ffmpeg 的机器上
+    每次打铃都会失败一次并打一条 WARNING（实机日志里每条铃声前后都有）。
+    """
+    global _FFMPEG_CACHE
+    if _FFMPEG_CACHE is not _UNSET:
+        return _FFMPEG_CACHE
+    try:
+        local = FFMPEG_DIR / "ffmpeg.exe"
+        if local.exists():
+            _FFMPEG_CACHE = str(local)
+            logger.info("使用内置 ffmpeg: %s", _FFMPEG_CACHE)
+            return _FFMPEG_CACHE
+    except Exception:
+        pass
+    found = shutil.which("ffmpeg") or ""
+    _FFMPEG_CACHE = found
+    if found:
+        logger.info("使用系统 ffmpeg: %s", found)
+    else:
+        logger.info("未找到 ffmpeg：非 WAV 音频交给 pygame 直接解码（M4A/AAC 可能不支持）")
+    return _FFMPEG_CACHE
 
 class AudioPlayer:
     """音频播放引擎（V2.1 重写：全局可取消 + 序列播放整体可停止）
@@ -187,14 +217,13 @@ class AudioPlayer:
         return dst
 
     def _convert_to_wav(self, src: str, dst: str) -> bool:
-        """用 ffmpeg 转 WAV"""
-        ffmpeg_path = FFMPEG_DIR / "ffmpeg.exe"
-        if not ffmpeg_path.exists():
-            # 尝试系统 PATH 中的 ffmpeg
-            ffmpeg_path = "ffmpeg"
+        """用 ffmpeg 转 WAV（无 ffmpeg 时静默返回 False，由调用方退回直接播放）"""
+        exe = ffmpeg_path()
+        if not exe:
+            return False
         try:
             subprocess.run(
-                [str(ffmpeg_path), "-y", "-loglevel", "error", "-i", src,
+                [exe, "-y", "-loglevel", "error", "-i", src,
                  "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "2", dst],
                 capture_output=True, timeout=30,
                 creationflags=SUBPROCESS_FLAGS
