@@ -3,6 +3,7 @@ name: Build BellSystem EXE
 on:
   push:
     branches: [main]
+    tags: ['v*']
   workflow_dispatch:
 
 jobs:
@@ -67,3 +68,51 @@ jobs:
         with:
           name: BellSystem-${{ matrix.arch }}.exe
           path: dist/BellSystem.exe
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download built exes
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p out
+          cp artifacts/BellSystem-x64.exe/BellSystem.exe out/BellSystem_x64.exe
+          cp artifacts/BellSystem-x86.exe/BellSystem.exe out/BellSystem_Win7_x86.exe
+          ls -l out
+
+      - name: Write release notes
+        run: |
+          cat > NOTES.md <<'EOF'
+          由 GitHub Actions 在每次推送到 main 后自动发布。
+
+          - BellSystem_x64.exe：64 位版，适用于 Windows 10 / 11
+          - BellSystem_Win7_x86.exe：32 位版，适用于 Windows 7（32/64 位通用）
+
+          绿色免安装：解压后双击运行即可，数据（数据库/日志/配置）保存在 exe 同目录的 data、logs、config 中。
+          升级说明：直接替换 exe 即可，旧 bell.db 与 settings.json 无需改动（会自动迁移）。
+          EOF
+          cat NOTES.md
+
+      - name: Publish rolling latest release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view latest >/dev/null 2>&1 || gh release create latest --title "最新构建（自动发布）" --notes-file NOTES.md
+          gh release upload latest out/BellSystem_x64.exe out/BellSystem_Win7_x86.exe --clobber
+          gh release edit latest --notes-file NOTES.md
+
+      - name: Attach to tag release (when pushing a tag)
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view "${{ github.ref_name }}" >/dev/null 2>&1 || gh release create "${{ github.ref_name }}" --title "${{ github.ref_name }}" --notes-file NOTES.md
+          gh release upload "${{ github.ref_name }}" out/BellSystem_x64.exe out/BellSystem_Win7_x86.exe --clobber
+          gh release edit "${{ github.ref_name }}" --notes-file NOTES.md

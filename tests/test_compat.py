@@ -9,6 +9,16 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 ALLOWED_THIRD_PARTY = {"pygame", "pystray", "PIL"}
+
+# 显式列出本项目用到的标准库（Python 3.8 没有 sys.stdlib_module_names，
+# 靠它判断会在 3.8 上把所有标准库都判成"第三方"）
+STDLIB_ALLOWED = {
+    "os", "sys", "re", "io", "json", "time", "csv", "hmac", "hashlib", "base64",
+    "queue", "socket", "sqlite3", "ctypes", "threading", "datetime", "subprocess",
+    "logging", "pathlib", "typing", "tempfile", "shutil", "traceback", "importlib",
+    "ast", "http", "urllib", "tkinter", "winreg", "webbrowser", "string", "math",
+    "collections", "functools", "itertools", "random", "glob", "contextlib",
+}
 FORBIDDEN_SYNTAX = ("match ", "| None", "removeprefix", "removesuffix",
                     "zoneinfo", "graphlib", "str | int")
 
@@ -51,7 +61,9 @@ def test_no_python39_plus_syntax():
 
 
 def test_no_unexpected_third_party_imports():
-    stdlib_ok = set(sys.stdlib_module_names) if hasattr(sys, "stdlib_module_names") else set()
+    stdlib_ok = set(STDLIB_ALLOWED)
+    if hasattr(sys, "stdlib_module_names"):
+        stdlib_ok |= set(sys.stdlib_module_names)
     for p in _py_files():
         tree = ast.parse(p.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
