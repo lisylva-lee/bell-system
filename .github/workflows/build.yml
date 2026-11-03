@@ -6,7 +6,31 @@ on:
   workflow_dispatch:
 
 jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.8.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.8.10'
+          architecture: x64
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Run tests
+        run: pytest tests -q
+
+      - name: Import smoke test (must stay Py3.8 compatible)
+        run: python -c "import bell_system, web_server, bellapp; print('import ok')"
+
   build:
+    needs: test
     runs-on: windows-latest
     strategy:
       fail-fast: false
@@ -25,11 +49,18 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pygame==2.5.2 pystray pillow pyinstaller
+          pip install -r requirements-dev.txt
 
       - name: Build EXE with PyInstaller
         run: |
           pyinstaller --onefile --windowed --icon=bell.ico --name=BellSystem --hidden-import=pygame --hidden-import=pystray --hidden-import=PIL bell_system.py
+
+      - name: Smoke test the exe exists and is not tiny
+        shell: pwsh
+        run: |
+          $f = Get-Item dist/BellSystem.exe
+          Write-Host "size = $($f.Length) bytes"
+          if ($f.Length -lt 5MB) { throw "exe too small, build likely broken" }
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

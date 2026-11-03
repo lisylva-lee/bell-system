@@ -9,15 +9,29 @@
 
 ```
 BellSystem/
-├── BellSystem_Win7_x86.exe ← 32位版（Win7 32/64位通用）
-├── BellSystem_x64.exe      ← 64位版（Win10/11 64位）
-├── bell_system.py          ← 源码
+├── bell_system.py          ← 入口（薄壳，兼容旧 import）
+├── web_server.py           ← 兼容壳（实现已移到 bellapp/web/api.py）
+├── bellapp/                ← 应用实现（v2.3 起分层）
+│   ├── paths.py            ← 路径解析（只读介质自动回退 %APPDATA%）
+│   ├── settings.py         ← 设置读写（只增键，旧配置无需改动）
+│   ├── logsetup.py         ← 日志（按天轮转，保留 30 天）
+│   ├── storage.py          ← SQLite（user_version 迁移 + 每线程连接 + 日志清理）
+│   ├── player.py           ← 播放引擎（代际号取消 + 转码缓存）
+│   ├── scheduler.py        ← 调度引擎（绝对时间轮询 + 日历感知）
+│   ├── csvio.py            ← 课表 CSV 导入导出
+│   ├── power.py            ← 开机自启 / 防休眠（SetThreadExecutionState）
+│   ├── app.py              ← 装配入口与退出清理
+│   ├── ui/                 ← main_window.py（主窗口）/ dialogs.py（各对话框）
+│   └── web/                ← api.py（HTTP 接口与鉴权）/ ui.py（内嵌网页）
+├── tests/                  ← pytest 用例（也可 python tests/run_all.py）
+├── requirements.txt        ← 运行期依赖（锁版本）
+├── requirements-dev.txt    ← 开发/CI 依赖（含 pytest、pyinstaller）
 ├── bell.ico                ← 程序图标
-├── .github/workflows/      ← CI 自动编译配置
+├── .github/workflows/      ← CI：先跑测试，再编译 x86/x64
 │
 ├── data/                   ← SQLite 数据库（自动创建，与 exe 同目录）
 │   └── bell.db
-├── logs/                   ← 运行日志（自动创建）
+├── logs/                   ← 运行日志（自动创建，按天轮转）
 ├── config/                 ← 配置文件（自动创建）
 └── ffmpeg/                 ← 可选：放 ffmpeg.exe 支持更多音频格式
 ```
@@ -60,19 +74,23 @@ BellSystem/
 push 到 `main` 自动编译 x86/x64 两个版本，产物在仓库 Actions 页面的 Artifacts：
 
 ```yaml
-# .github/workflows/build.yml 核心
-- uses: actions/setup-python@v5
-  with:
-    python-version: '3.8.10'      # 最后一个官方支持 Win7 的版本
-    architecture: ${{ matrix.arch }}  # x86 / x64
-- run: pip install pygame==2.5.2 pystray pillow pyinstaller
-- run: pyinstaller --onefile --windowed --icon=bell.ico --name=BellSystem bell_system.py
+# .github/workflows/build.yml 核心（v2.3：先测后编，依赖锁版本）
+test:
+  - uses: actions/setup-python@v5
+    with: {python-version: '3.8.10'}
+  - run: pip install -r requirements-dev.txt
+  - run: pytest tests -q
+build:
+  needs: test
+  strategy: {matrix: {arch: [x86, x64]}}
+  - run: pyinstaller --onefile --windowed --icon=bell.ico --name=BellSystem bell_system.py
 ```
 
 ### 本地编译
 
 ```bash
-pip install pyinstaller pygame pystray pillow
+pip install -r requirements-dev.txt
+python tests/run_all.py          # 或 pytest tests -q
 pyinstaller --onefile --windowed --icon=bell.ico --name="BellSystem" \
   --hidden-import=pygame --hidden-import=pystray --hidden-import=PIL bell_system.py
 ```
@@ -87,6 +105,21 @@ pyinstaller --onefile --windowed --icon=bell.ico --name="BellSystem" \
 - 数据目录（data/）需有写入权限；放 U 盘、共享盘均可
 
 ## 版本历史
+
+### v2.3 (2026-11-03) — 结构重构与工程化（**功能与数据行为不变**）
+- 🧱 分层重构：拆为 `bellapp/`（paths / settings / logsetup / storage / player / scheduler /
+  csvio / power / ui / web / app），入口 `bell_system.py` 与 `web_server.py` 保留为薄壳，旧 `import` 用法不受影响
+- 🗄 数据库引入 `PRAGMA user_version` **顺序迁移框架**（v1 基线 / v2 日志索引 / v3 日历表），
+  只做加法、永不删改既有列 —— 旧 `bell.db` 升级后数据一字不差
+- 🔌 SQLite 改为**每线程一条连接**（+ `busy_timeout`），消除多线程共用一条连接时隐式事务被提前提交的风险
+- 🧹 执行日志按天**轮转**（保留 30 天）+ 自动清理（保留 90 天 / 最多 1 万条），不再无限增长
+- 🔋 「禁止休眠」改用 `SetThreadExecutionState`，**只在程序运行期间生效**，退出自动恢复；
+  不再用 `powercfg` 永久改写系统电源策略（旧实现退出后不恢复）
+- 📁 数据目录不可写（只读 U 盘 / 无权限共享盘）时自动回退到 `%APPDATA%\BellSystem`
+- 🧪 新增 `tests/`（29 个用例，覆盖存储迁移/调度/播放/Web/CSV/界面冒烟），CI 改为**先跑测试再编译**；
+  依赖版本全部锁定（`requirements*.txt`）
+- 🗑 删除 `simulate_scheduler.py` / `test_dynamic_add.py`：它们是调度逻辑的手工复制副本，
+  已与真实实现分叉（同一输入 `HH:MM` 真实实现正常、副本抛异常），属"假测试"
 
 ### v2.2 (2026-11-03) — 功能增强
 - 📅 新增「节假日 / 调休日历」：放假日全天不打铃；调休补课日可指定「按星期几的课表」打铃

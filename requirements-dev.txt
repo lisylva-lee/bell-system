@@ -1,0 +1,4 @@
+# 开发/CI 依赖
+-r requirements.txt
+pyinstaller==6.11.1
+pytest==8.3.5
