@@ -9,8 +9,11 @@
 - 可选访问令牌(Token)保护
 """
 
+import os
 import json
 import re
+import hmac
+import time
 import socket
 import threading
 import datetime
@@ -21,7 +24,41 @@ from pathlib import Path
 
 logger = logging.getLogger("BellSystem.Web")
 
-WEB_VERSION = "2.0"
+WEB_VERSION = "2.1"
+
+# ---------- V2.1 安全常量 ----------
+ALLOWED_AUDIO_EXT = {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac"}
+MAX_AUDIO_PATH_LEN = 260
+MAX_BODY_BYTES = 256 * 1024        # 请求体上限（旧实现允许 1MB）
+REQUEST_TIMEOUT = 15               # 单连接读超时，防慢速连接占线程
+MAX_CONCURRENT_REQUESTS = 32       # 并发请求上限
+AUTH_FAIL_WINDOW = 60              # 令牌失败计数窗口（秒）
+AUTH_FAIL_MAX = 5                  # 窗口内允许的失败次数
+
+# 令牌失败计数（按来源 IP），进程内共享
+_auth_fail_lock = threading.Lock()
+_auth_fail_map = {}
+
+
+def _auth_blocked(ip: str) -> bool:
+    now = time.time()
+    with _auth_fail_lock:
+        times = [t for t in _auth_fail_map.get(ip, []) if now - t < AUTH_FAIL_WINDOW]
+        _auth_fail_map[ip] = times
+        return len(times) >= AUTH_FAIL_MAX
+
+
+def _auth_fail_add(ip: str):
+    with _auth_fail_lock:
+        _auth_fail_map.setdefault(ip, []).append(time.time())
+
+
+def _as_int(value):
+    """把请求里的 id 之类安全转成 int，失败返回 None（不再抛异常打成 500）"""
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError, AttributeError):
+        return None
 
 
 def get_local_urls(port: int):
@@ -49,6 +86,30 @@ def get_local_urls(port: int):
 _TIME_RE = re.compile(r"^(\d{1,2}):(\d{1,2})(?::(\d{1,2}))?$")
 
 
+def validate_audio_path(audio: str):
+    """校验 Web 端提交的铃声路径，返回 (ok, 错误信息)。
+
+    Web 端只能填"服务器本机"的音频文件：拒绝 UNC/网络路径（会触发 SMB 外联，
+    既慢又可能泄露凭据）、限制后缀白名单、要求文件真实存在。
+    """
+    if not audio:
+        return False, "铃声文件不能为空"
+    if len(audio) > MAX_AUDIO_PATH_LEN:
+        return False, "铃声路径过长（≤%d 字符）" % MAX_AUDIO_PATH_LEN
+    if audio.startswith("\\\\") or audio.startswith("//"):
+        return False, "不支持网络路径（UNC），请使用服务器本机路径"
+    if "://" in audio:
+        return False, "不支持 URL，请使用服务器本机路径"
+    ext = os.path.splitext(audio)[1].lower()
+    if ext not in ALLOWED_AUDIO_EXT:
+        return False, "不支持的音频格式，仅允许 %s" % "/".join(sorted(ALLOWED_AUDIO_EXT))
+    if not os.path.exists(audio):
+        return False, "铃声文件不存在（请填写服务器本机上的完整路径）"
+    if not os.path.isfile(audio):
+        return False, "铃声路径不是文件"
+    return True, ""
+
+
 def validate_schedule(data: dict):
     """校验并规范化任务数据，返回 (规范后的dict, 错误信息)"""
     if not isinstance(data, dict):
@@ -61,8 +122,9 @@ def validate_schedule(data: dict):
         return None, "任务名称过长（≤50 字）"
 
     audio = str(data.get("audio_file", "")).strip()
-    if not audio:
-        return None, "铃声文件不能为空"
+    ok, audio_err = validate_audio_path(audio)
+    if not ok:
+        return None, audio_err
 
     stype = str(data.get("schedule_type", "")).strip()
     if stype not in ("daily", "weekly", "date", "once"):
@@ -123,7 +185,8 @@ def validate_schedule(data: dict):
         "volume": volume,
         "play_count": play_count,
         "enabled": enabled,
-        "profile_id": int(data.get("profile_id", 0) or 0),
+        # V2.1: 忽略客户端传来的 profile_id，由服务端决定（防跨方案写入）
+        "profile_id": 0,
     }, ""
 
 
@@ -134,6 +197,7 @@ class ApiHandler(BaseHTTPRequestHandler):
     # 由 BellWebServer 注入：{"db","player","scheduler","token","on_change"}
     ctx = {}
     server_version = "BellSystemWeb/" + WEB_VERSION
+    timeout = REQUEST_TIMEOUT          # V2.1: 单连接读超时，防慢速连接长期占用线程
 
     # ---------- 基础 ----------
     def log_message(self, fmt, *args):
@@ -157,22 +221,64 @@ class ApiHandler(BaseHTTPRequestHandler):
     def _err(self, code: int, msg: str):
         self._send_json(code, {"ok": False, "error": msg})
 
+    def _client_ip(self) -> str:
+        try:
+            return self.client_address[0]
+        except Exception:
+            return "?"
+
     def _authorized(self) -> bool:
+        """V2.1 加固：
+        - 令牌只接受 X-Auth-Token 请求头（不再接受 ?token=，避免进浏览器历史/代理日志/Referer）
+        - hmac.compare_digest 恒定时间比较，避免逐字符时序爆破
+        - 同一来源 IP 在窗口内失败过多则临时拒绝，阻止暴力猜测
+        """
         token = str(self.ctx.get("token") or "")
         if not token:
             return True
-        if self.headers.get("X-Auth-Token", "") == token:
+        ip = self._client_ip()
+        if _auth_blocked(ip):
+            self._blocked = True
+            return False
+        supplied = self.headers.get("X-Auth-Token", "") or ""
+        if supplied and hmac.compare_digest(supplied, token):
             return True
-        q = parse_qs(urlsplit(self.path).query)
-        supplied = (q.get("token") or [""])[0]
-        return supplied == token
+        _auth_fail_add(ip)
+        return False
+
+    def _deny(self):
+        if getattr(self, "_blocked", False):
+            return self._err(429, "令牌尝试过于频繁，请稍后再试")
+        return self._err(401, "需要访问令牌")
+
+    def _check_content_type(self) -> bool:
+        """只接受 application/json（浏览器跨站"简单请求"无法伪造该类型，从而挡住 CSRF）"""
+        ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        return ctype == "application/json"
+
+    def _check_origin(self) -> bool:
+        """浏览器跨站请求的 Origin 与本站 Host 不一致时拒绝（非浏览器客户端无 Origin，放行）"""
+        origin = self.headers.get("Origin")
+        if not origin:
+            return True
+        try:
+            origin_host = (urlsplit(origin).hostname or "").lower()
+        except ValueError:
+            return False
+        host_header = (self.headers.get("Host") or "").split(":")[0].strip().lower()
+        if not host_header:
+            return True
+        if origin_host == host_header:
+            return True
+        allowed = {str(a).lower() for a in (self.ctx.get("allow_origins") or [])}
+        return origin_host in allowed
 
     def _read_json(self) -> dict:
         try:
             length = int(self.headers.get("Content-Length", 0) or 0)
         except ValueError:
             length = 0
-        if length <= 0 or length > 1000000:
+        if length <= 0 or length > MAX_BODY_BYTES:
             return {}
         try:
             raw = self.rfile.read(length)
@@ -251,7 +357,24 @@ class ApiHandler(BaseHTTPRequestHandler):
             "next": next_info,
             "active_profile": {"id": active_id, "name": active_name},
             "version": WEB_VERSION,
+            # V2.1: 让前端能提示"当前没有访问令牌"
+            "auth_required": bool(self.ctx.get("token")),
+            # V2.2: 最近 24 小时的失败/漏打，前端用红色横幅提示
+            "alerts": self._alerts_payload(db),
         }
+
+    @staticmethod
+    def _alerts_payload(db) -> list:
+        try:
+            rows = db.get_recent_alerts(24, 3)
+        except Exception:
+            return []
+        return [{
+            "time": r["execute_time"],
+            "name": r["schedule_name"] or "",
+            "status": r["status"],
+            "error": r["error_message"] or "",
+        } for r in rows]
 
     # ---------- GET ----------
     def do_GET(self):
@@ -261,7 +384,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         if not path.startswith("/api/"):
             return self._err(404, "未找到")
         if not self._authorized():
-            return self._err(401, "需要访问令牌")
+            return self._deny()
         try:
             if path == "/api/status":
                 return self._ok(status=self._status_payload())
@@ -286,16 +409,21 @@ class ApiHandler(BaseHTTPRequestHandler):
                 return self._ok(logs=logs)
             return self._err(404, "未知接口")
         except Exception as e:
+            # V2.1: 异常细节只进日志，不回传给客户端（避免泄露内部实现）
             logger.error("GET %s 失败: %s", path, e, exc_info=True)
-            return self._err(500, "服务器内部错误: %s" % e)
+            return self._err(500, "服务器内部错误，请查看服务器日志")
 
     # ---------- POST ----------
     def do_POST(self):
         path = urlsplit(self.path).path
         if not path.startswith("/api/"):
             return self._err(404, "未找到")
+        if not self._check_content_type():
+            return self._err(415, "Content-Type 必须是 application/json")
+        if not self._check_origin():
+            return self._err(403, "拒绝跨站请求")
         if not self._authorized():
-            return self._err(401, "需要访问令牌")
+            return self._deny()
         data = self._read_json()
         db = self.ctx["db"]
         player = self.ctx["player"]
@@ -311,8 +439,10 @@ class ApiHandler(BaseHTTPRequestHandler):
                 return self._ok(id=sid)
 
             if path == "/api/schedules/update":
-                sid = int(data.get("id", 0) or 0)
-                row = db.conn.execute("SELECT * FROM schedules WHERE id=?", (sid,)).fetchone()
+                sid = _as_int(data.get("id"))
+                if sid is None:
+                    return self._err(400, "任务 id 无效")
+                row = db.get_schedule(sid)
                 if not row:
                     return self._err(404, "任务不存在")
                 norm, err = validate_schedule(data)
@@ -326,8 +456,10 @@ class ApiHandler(BaseHTTPRequestHandler):
                 return self._ok(id=sid)
 
             if path == "/api/schedules/delete":
-                sid = int(data.get("id", 0) or 0)
-                row = db.conn.execute("SELECT * FROM schedules WHERE id=?", (sid,)).fetchone()
+                sid = _as_int(data.get("id"))
+                if sid is None:
+                    return self._err(400, "任务 id 无效")
+                row = db.get_schedule(sid)
                 if not row:
                     return self._err(404, "任务不存在")
                 db.delete_schedule(sid)
@@ -335,8 +467,10 @@ class ApiHandler(BaseHTTPRequestHandler):
                 return self._ok(id=sid)
 
             if path == "/api/schedules/toggle":
-                sid = int(data.get("id", 0) or 0)
-                row = db.conn.execute("SELECT * FROM schedules WHERE id=?", (sid,)).fetchone()
+                sid = _as_int(data.get("id"))
+                if sid is None:
+                    return self._err(400, "任务 id 无效")
+                row = db.get_schedule(sid)
                 if not row:
                     return self._err(404, "任务不存在")
                 enabled = bool(data.get("enabled", not row["enabled"]))
@@ -352,10 +486,9 @@ class ApiHandler(BaseHTTPRequestHandler):
                         error = "" if result else "播放失败"
                         db.add_log(task["id"], task["name"], task["audio_file"], status, error)
                     return on_play
-                sid = data.get("schedule_id")
-                if sid:
-                    row = db.conn.execute(
-                        "SELECT * FROM schedules WHERE id=?", (int(sid),)).fetchone()
+                sid = _as_int(data.get("schedule_id"))
+                if sid is not None:
+                    row = db.get_schedule(sid)
                     if not row:
                         return self._err(404, "任务不存在")
                     logger.info("远程立即打铃: %s", row["name"])
@@ -367,10 +500,10 @@ class ApiHandler(BaseHTTPRequestHandler):
                 if not enabled:
                     return self._err(400, "当前没有启用的任务")
                 def play_all():
-                    for s in enabled:
-                        logger.info("远程立即打铃: %s", s["name"])
-                        ok = player.play(s["audio_file"], s["volume"], s["play_count"])
-                        make_logger(s)(ok)
+                    # V2.1: 走 play_many，"停止播放"可整体打断整个序列
+                    player.play_many(
+                        enabled,
+                        on_item=lambda s, ok: make_logger(s)(ok))
                 threading.Thread(target=play_all, daemon=True).start()
                 return self._ok(message="依次播放 %d 个启用任务" % len(enabled))
 
@@ -403,7 +536,9 @@ class ApiHandler(BaseHTTPRequestHandler):
                 return self._ok(id=pid)
 
             if path == "/api/profiles/activate":
-                pid = int(data.get("id", 0) or 0)
+                pid = _as_int(data.get("id"))
+                if pid is None:
+                    return self._err(400, "方案 id 无效")
                 if not any(p["id"] == pid for p in db.get_profiles()):
                     return self._err(404, "方案不存在")
                 db.activate_profile(pid)
@@ -411,7 +546,9 @@ class ApiHandler(BaseHTTPRequestHandler):
                 return self._ok(id=pid)
 
             if path == "/api/profiles/delete":
-                pid = int(data.get("id", 0) or 0)
+                pid = _as_int(data.get("id"))
+                if pid is None:
+                    return self._err(400, "方案 id 无效")
                 if pid == db.get_active_profile_id():
                     return self._err(400, "不能删除当前启用的方案")
                 if not any(p["id"] == pid for p in db.get_profiles()):
@@ -422,13 +559,47 @@ class ApiHandler(BaseHTTPRequestHandler):
 
             return self._err(404, "未知接口")
         except Exception as e:
+            # V2.1: 异常细节只进日志，不回传给客户端
             logger.error("POST %s 失败: %s", path, e, exc_info=True)
-            return self._err(500, "服务器内部错误: %s" % e)
+            return self._err(500, "服务器内部错误，请查看服务器日志")
 
 
 # ============================================================
 # 服务封装
 # ============================================================
+class BoundedThreadingHTTPServer(ThreadingHTTPServer):
+    """限制并发请求数的 ThreadingHTTPServer（防止局域网设备刷爆线程）"""
+
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def __init__(self, server_address, handler,
+                 max_workers: int = MAX_CONCURRENT_REQUESTS):
+        self._slots = threading.BoundedSemaphore(max_workers)
+        ThreadingHTTPServer.__init__(self, server_address, handler)
+
+    def process_request(self, request, client_address):
+        if not self._slots.acquire(False):
+            try:
+                request.sendall(b"HTTP/1.1 503 Service Unavailable\r\n"
+                                b"Content-Length: 0\r\nConnection: close\r\n\r\n")
+                request.close()
+            except Exception:
+                pass
+            return
+        try:
+            ThreadingHTTPServer.process_request(self, request, client_address)
+        except Exception:
+            self._slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            ThreadingHTTPServer.process_request_thread(self, request, client_address)
+        finally:
+            self._slots.release()
+
+
 class BellWebServer:
     """打铃系统 Web 远程控制服务（线程安全，随主程序后台运行）"""
 
@@ -456,7 +627,7 @@ class BellWebServer:
                     "on_change": self.on_change,
                 }
             })
-            self._httpd = ThreadingHTTPServer(("0.0.0.0", self.port), handler)
+            self._httpd = BoundedThreadingHTTPServer(("0.0.0.0", self.port), handler)
             self._thread = threading.Thread(
                 target=self._httpd.serve_forever, daemon=True, name="BellWebServer")
             self._thread.start()
@@ -555,6 +726,9 @@ details summary{cursor:pointer;font-size:15px;font-weight:700}
 .volrow input{flex:1}
 .sheetbtns{display:flex;gap:10px;margin-top:16px}
 .sheetbtns button{flex:1;padding:12px;font-size:15px}
+.alertbar{background:#fdecea;border:1px solid #f5b5ae;color:#8c1d13;border-radius:10px;padding:10px 12px;font-size:13px;margin-bottom:12px;line-height:1.6}
+.alertbar b{font-weight:700}
+.secwarn{background:#fff4e5;border:1px solid #ffcc80;color:#8a5300;border-radius:10px;padding:10px 12px;font-size:13px;margin-bottom:12px;line-height:1.5}
 .toast{position:fixed;top:60px;left:50%;transform:translateX(-50%);background:rgba(0,0,0,.75);color:#fff;padding:8px 18px;border-radius:20px;font-size:13px;z-index:30;display:none;max-width:80vw}
 </style>
 </head>
@@ -564,6 +738,8 @@ details summary{cursor:pointer;font-size:15px;font-weight:700}
   <select id="profileSel" onchange="switchProfile(this.value)"></select>
 </header>
 <main>
+  <div class="alertbar" id="alertBar" style="display:none"></div>
+  <div class="secwarn" id="secWarn" style="display:none">⚠ 未设置访问令牌：同一局域网内任何设备都能打开本页操作打铃。建议在电脑端「系统设置 → 访问令牌」设置。</div>
   <section class="card">
     <div class="clock" id="clock">--:--:--</div>
     <div class="nextline" id="nextTime">--</div>
@@ -653,14 +829,17 @@ function esc(s){
   return d.innerHTML;
 }
 
-function qs(path){
-  return TOKEN ? path + (path.indexOf('?') >= 0 ? '&' : '?') + 'token=' + encodeURIComponent(TOKEN) : path;
+function authHeaders(){
+  // V2.1: 令牌只走请求头，不再拼进 URL（避免进浏览器历史/代理日志/Referer）
+  var h = {'Content-Type':'application/json'};
+  if (TOKEN) h['X-Auth-Token'] = TOKEN;
+  return h;
 }
 
 function api(path, opts, tries){
   opts = opts || {};
   tries = tries || 0;
-  return fetch(qs(path), Object.assign({headers:{'Content-Type':'application/json'}}, opts))
+  return fetch(path, Object.assign({}, opts, {headers: authHeaders()}))
     .then(function(r){
       if (r.status === 401) {
         if (tries >= 2) throw new Error('令牌错误');
@@ -693,6 +872,9 @@ function pollStatus(){
     LAST_TICK = Date.now();
     renderNext();
     renderProfiles(s.active_profile);
+    var warn = $('secWarn');
+    if (warn) warn.style.display = (s.auth_required === false) ? 'block' : 'none';
+    renderAlerts(s.alerts);
   }).catch(function(){});
 }
 
@@ -708,6 +890,22 @@ function renderNext(){
   var m = Math.floor(left % 3600 / 60);
   var sec = left % 60;
   $('nextDist').textContent = '距离 ' + (h > 0 ? h + ' 时 ' : '') + m + ' 分 ' + sec + ' 秒';
+}
+
+// ---------- 失败/漏打告警 ----------
+function renderAlerts(alerts){
+  var box = $('alertBar');
+  if (!box) return;
+  if (!alerts || !alerts.length) { box.style.display = 'none'; return; }
+  var html = '<b>⚠ 最近 24 小时有 ' + alerts.length + ' 次异常</b><br>';
+  for (var i = 0; i < alerts.length; i++) {
+    var a = alerts[i];
+    var tag = a.status === 'missed' ? '漏打' : '失败';
+    html += esc(a.time || '') + ' · ' + esc(a.name || '') + ' · ' + tag
+         + (a.error ? '（' + esc(a.error) + '）' : '') + '<br>';
+  }
+  box.innerHTML = html;
+  box.style.display = 'block';
 }
 
 // ---------- 方案 ----------

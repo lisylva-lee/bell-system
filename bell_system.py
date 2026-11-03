@@ -8,8 +8,10 @@ Windows 7/10/11 通用
 
 import os
 import sys
+import re
 import json
 import time
+import hashlib
 import sqlite3
 import threading
 import datetime
@@ -42,6 +44,15 @@ from web_server import BellWebServer
 # Windows 下子进程（ffmpeg 转码 / powercfg 等）不弹出黑色控制台窗口
 SUBPROCESS_FLAGS = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 
+
+def _row_get(row, key, default=None):
+    """兼容 sqlite3.Row / dict 的取值助手"""
+    try:
+        value = row[key]
+    except (IndexError, KeyError, TypeError):
+        return default
+    return default if value is None else value
+
 # ============================================================
 # 路径配置
 # ============================================================
@@ -73,6 +84,8 @@ DEFAULT_SETTINGS = {
     "web_enabled": False,
     "web_port": 8787,
     "web_token": "",
+    # V2.1 调度容错：到点后多久之内仍算"准点"，超出即记为漏打（不再补打）
+    "missed_tolerance_sec": 60,
 }
 
 
@@ -161,6 +174,20 @@ class Database:
                 error_message TEXT DEFAULT ''
             )
         """)
+        # V2.1: 执行日志按时间倒序查询，加索引避免全表扫描
+        c.execute("CREATE INDEX IF NOT EXISTS idx_logs_execute_time ON logs(execute_time)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_logs_schedule_id ON logs(schedule_id)")
+        # V2.2: 节假日 / 调休补课日历（纯新增表，不影响既有表结构与数据）
+        #   kind='holiday' → 该日全天不打铃
+        #   kind='workday' → 该日照常打铃；mirror_weekday 0-6 表示"按星期几的课表"（调休补课），-1 表示按真实星期
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS calendar_days (
+                day TEXT PRIMARY KEY,
+                kind TEXT NOT NULL DEFAULT 'holiday',
+                mirror_weekday INTEGER DEFAULT -1,
+                note TEXT DEFAULT ''
+            )
+        """)
         # 检查是否有默认方案
         c.execute("SELECT COUNT(*) FROM profiles")
         if c.fetchone()[0] == 0:
@@ -174,6 +201,10 @@ class Database:
                 (profile_id,)
             ).fetchall()
         return self.conn.execute("SELECT * FROM schedules ORDER BY time_str").fetchall()
+
+    def get_schedule(self, sid: int):
+        """按 id 取单个任务（GUI/Web 共用，避免各自写裸 SQL 绕过锁）"""
+        return self.conn.execute("SELECT * FROM schedules WHERE id=?", (sid,)).fetchone()
 
     def add_schedule(self, data: dict) -> int:
         with self.lock:
@@ -263,6 +294,43 @@ class Database:
             "SELECT * FROM logs ORDER BY execute_time DESC LIMIT ?", (limit,)
         ).fetchall()
 
+    # ---- V2.2 日历 ----
+    def get_calendar(self) -> dict:
+        """返回 {YYYY-MM-DD: {kind, mirror_weekday, note}}；空表返回 {}"""
+        try:
+            rows = self.conn.execute(
+                "SELECT day, kind, mirror_weekday, note FROM calendar_days").fetchall()
+        except sqlite3.DatabaseError:
+            return {}
+        return {
+            r["day"]: {
+                "kind": r["kind"] or "holiday",
+                "mirror_weekday": int(r["mirror_weekday"] if r["mirror_weekday"] is not None else -1),
+                "note": r["note"] or "",
+            }
+            for r in rows
+        }
+
+    def set_calendar_day(self, day: str, kind: str, mirror_weekday: int = -1, note: str = ""):
+        with self.lock:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO calendar_days (day, kind, mirror_weekday, note) VALUES (?,?,?,?)",
+                (day, kind, int(mirror_weekday), note))
+            self.conn.commit()
+
+    def delete_calendar_day(self, day: str):
+        with self.lock:
+            self.conn.execute("DELETE FROM calendar_days WHERE day=?", (day,))
+            self.conn.commit()
+
+    # ---- V2.2 告警 ----
+    def get_recent_alerts(self, hours: int = 24, limit: int = 5) -> List[sqlite3.Row]:
+        """最近 N 小时内"失败 / 漏打"的执行记录（供失败告警用）"""
+        since = (datetime.datetime.now() - datetime.timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
+        return self.conn.execute(
+            "SELECT * FROM logs WHERE status IN ('failed','missed') AND execute_time >= ? "
+            "ORDER BY execute_time DESC LIMIT ?", (since, limit)).fetchall()
+
     def close(self):
         self.conn.close()
 
@@ -271,20 +339,62 @@ class Database:
 # 音频播放引擎
 # ============================================================
 class AudioPlayer:
+    """音频播放引擎（V2.1 重写：全局可取消 + 序列播放整体可停止）
+
+    旧实现的三个问题：
+    1) `_stop_flag` 在每次 play() 开头被复位 → 序列播放时"停止"只停当前一首，后续继续响；
+    2) `_playing/_current_file` 被多个播放线程共享 → 状态互相覆盖，Web 的 playing 字段不可信；
+    3) 到点打铃与 Web"立即打铃"并发时，pygame.mixer.music 单通道会被抢。
+    新实现用"代际号(epoch)"表达取消：stop() 使 epoch+1，所有在途/后续播放立即失效。
+    """
+
     def __init__(self):
+        self._lock = threading.RLock()
+        self._epoch = 0
         self._playing = False
-        self._stop_flag = False
         self._current_file = None
         if pygame:
             try:
                 pygame.mixer.init(frequency=44100, size=-16, channels=2, buffer=4096)
             except Exception as e:
-                logger.warning(f"pygame.mixer 初始化失败: {e}")
+                logger.warning(f"pygame.mixer 初始化失败（可能无音频设备）: {e}")
 
-    def play(self, file_path: str, volume: int = 80, count: int = 1) -> bool:
-        """播放音频文件，返回是否成功"""
+    # ---------- 取消语义 ----------
+    def current_epoch(self) -> int:
+        with self._lock:
+            return self._epoch
+
+    def is_cancelled(self, epoch: Optional[int]) -> bool:
+        if epoch is None:
+            return False
+        with self._lock:
+            return epoch != self._epoch
+
+    def stop(self):
+        """停止播放：当前曲目立即停，序列播放中的后续曲目也会被跳过"""
+        with self._lock:
+            self._epoch += 1
+            self._playing = False
+        if pygame and pygame.mixer.get_init():
+            try:
+                pygame.mixer.music.stop()
+            except Exception:
+                pass
+
+    def is_playing(self) -> bool:
+        with self._lock:
+            return self._playing
+
+    # ---------- 播放 ----------
+    def play(self, file_path: str, volume: int = 80, count: int = 1,
+             epoch: Optional[int] = None) -> bool:
+        """同步播放，返回是否至少播放了一次；epoch 用于响应 stop()"""
         if not pygame:
             logger.error("pygame 未安装，无法播放音频")
+            return False
+        if epoch is None:
+            epoch = self.current_epoch()
+        if self.is_cancelled(epoch):
             return False
 
         path = Path(file_path)
@@ -293,65 +403,106 @@ class AudioPlayer:
             return False
 
         try:
-            # 尝试用 ffmpeg 转换非 WAV 格式
-            ext = path.suffix.lower()
-            if ext not in (".wav",):
-                wav_path = DATA_DIR / f"_play_temp_{path.stem}.wav"
-                if not self._convert_to_wav(str(path), str(wav_path)):
-                    # 直接尝试 pygame 播放
-                    pass
-                else:
-                    path = wav_path
+            # 非 WAV：优先用转码缓存（首次转码，之后直接复用，避免每次打铃都等 ffmpeg）
+            if path.suffix.lower() != ".wav":
+                cached = self._ensure_wav_cache(path)
+                if cached is not None:
+                    path = cached
 
             pygame.mixer.music.load(str(path))
             pygame.mixer.music.set_volume(max(0.0, min(1.0, volume / 100.0)))
-            self._current_file = str(path)
-            self._stop_flag = False
-            self._playing = True
+            with self._lock:
+                self._current_file = str(path)
+                self._playing = True
 
-            for _ in range(count):
-                if self._stop_flag:
+            played = 0
+            for _ in range(max(1, int(count))):
+                if self.is_cancelled(epoch):
                     break
                 pygame.mixer.music.play()
                 while pygame.mixer.music.get_busy():
-                    if self._stop_flag:
+                    if self.is_cancelled(epoch):
                         pygame.mixer.music.stop()
                         break
-                    time.sleep(0.1)
-
-            self._playing = False
-            # 清理临时文件
-            if path != Path(file_path):
-                try:
-                    path.unlink()
-                except:
-                    pass
-            return True
+                    time.sleep(0.05)
+                played += 1
+            return played > 0
         except Exception as e:
             logger.error(f"播放失败: {e}")
-            self._playing = False
             return False
+        finally:
+            with self._lock:
+                self._playing = False
 
     def play_async(self, file_path: str, volume: int = 80, count: int = 1, callback=None):
-        """异步播放"""
+        """异步播放（回调收到是否成功）"""
+        epoch = self.current_epoch()
+
         def _run():
-            result = self.play(file_path, volume, count)
+            ok = self.play(file_path, volume, count, epoch=epoch)
             if callback:
-                callback(result)
+                try:
+                    callback(ok)
+                except Exception:
+                    pass
+
         threading.Thread(target=_run, daemon=True).start()
 
-    def stop(self):
-        """停止播放"""
-        self._stop_flag = True
-        if pygame and pygame.mixer.get_init():
-            try:
-                pygame.mixer.music.stop()
-            except:
-                pass
-        self._playing = False
+    def play_many(self, tasks, on_item=None) -> int:
+        """按顺序播放一组任务，返回实际播放条数；期间调用 stop() 会整体打断。
 
-    def is_playing(self) -> bool:
-        return self._playing
+        tasks 为可索引对象（sqlite3.Row / dict），需含 audio_file/volume/play_count/name。
+        """
+        epoch = self.current_epoch()
+        played = 0
+        total = len(tasks)
+        for idx, t in enumerate(tasks):
+            if self.is_cancelled(epoch):
+                logger.info("序列播放已被停止，剩余 %d 条跳过", total - idx)
+                break
+            audio = _row_get(t, "audio_file", "")
+            volume = int(_row_get(t, "volume", 80) or 80)
+            count = int(_row_get(t, "play_count", 1) or 1)
+            ok = self.play(audio, volume, count, epoch=epoch)
+            if self.is_cancelled(epoch):
+                break
+            played += 1
+            if on_item:
+                try:
+                    on_item(t, ok)
+                except Exception:
+                    pass
+        return played
+
+    # ---------- 转码缓存 ----------
+    def _ensure_wav_cache(self, path: Path) -> Optional[Path]:
+        """把非 WAV 音频转成 WAV 并缓存；失败返回 None（调用方退回直接播放原文件）"""
+        cache_dir = DATA_DIR / "cache"
+        try:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            st = path.stat()
+            key = "%s|%d|%d" % (str(path).lower(), int(st.st_mtime), st.st_size)
+            digest = hashlib.sha1(key.encode("utf-8", "replace")).hexdigest()[:16]
+            stem = re.sub(r"[^0-9A-Za-z_.-]", "_", path.stem)[:40]
+            dst = cache_dir / ("%s_%s.wav" % (stem, digest))
+            if dst.exists() and dst.stat().st_size > 44:
+                return dst
+        except Exception as e:
+            logger.warning(f"转码缓存目录不可用: {e}")
+            return None
+
+        tmp = dst.with_name(dst.stem + ".tmp.wav")
+        if not self._convert_to_wav(str(path), str(tmp)):
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            return None
+        try:
+            tmp.replace(dst)
+        except OSError:
+            return tmp if tmp.exists() else None
+        return dst
 
     def _convert_to_wav(self, src: str, dst: str) -> bool:
         """用 ffmpeg 转 WAV"""
@@ -361,7 +512,8 @@ class AudioPlayer:
             ffmpeg_path = "ffmpeg"
         try:
             subprocess.run(
-                [str(ffmpeg_path), "-y", "-i", src, "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "2", dst],
+                [str(ffmpeg_path), "-y", "-loglevel", "error", "-i", src,
+                 "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "2", dst],
                 capture_output=True, timeout=30,
                 creationflags=SUBPROCESS_FLAGS
             )
@@ -375,6 +527,9 @@ class AudioPlayer:
 # 定时引擎
 # ============================================================
 class Scheduler:
+    POLL_INTERVAL = 1.0          # 远距离等待步长（秒）；临近到点自动收紧到 0.2 秒
+    SAFETY_RECHECK = 30.0        # 无 resync 时的兜底重算间隔（应对有人直接改库）
+
     def __init__(self, db: Database, player: AudioPlayer):
         self.db = db
         self.player = player
@@ -388,6 +543,11 @@ class Scheduler:
         self._listeners = []
         # V2.0.1: 数据被 GUI/Web 修改后置位，等待循环立即中断并重新规划
         self._resync = threading.Event()
+        # V2.1: 计划信息被调度线程写、GUI/Web 线程读，加锁保证读到一致快照
+        self._state_lock = threading.RLock()
+        self._tolerance = 60
+        # V2.2: 日历缓存（每回合刷新；{YYYY-MM-DD: {...}}）
+        self._calendar = {}
 
     def add_listener(self, fn):
         self._listeners.append(fn)
@@ -428,14 +588,87 @@ class Scheduler:
         return self._pause
 
     def get_next_time(self) -> Optional[str]:
-        return self._next_time
+        with self._state_lock:
+            return self._next_time
 
     def get_next_info(self):
         """返回 (下一次执行的具体时间 datetime, 任务名称)，供界面精确计算距离"""
-        return self._next_dt, self._next_task_name
+        with self._state_lock:
+            return self._next_dt, self._next_task_name
+
+    def _set_next(self, next_dt, task):
+        with self._state_lock:
+            self._next_dt = next_dt
+            self._next_task_name = _row_get(task, "name", "") if task is not None else None
+            self._next_task_id = _row_get(task, "id", None) if task is not None else None
+            self._next_time = next_dt.strftime("%H:%M:%S") if next_dt else None
+
+    def _effective_weekday(self, d: datetime.date, calendar=None) -> Optional[int]:
+        """该日期"应该按星期几"打铃。
+
+        None  → 当天放假（holiday），全天不打铃
+        0-6   → 生效星期（workday 且指定 mirror_weekday 时按映射的星期，否则按真实星期）
+        """
+        cal = self._calendar if calendar is None else calendar
+        info = cal.get(d.isoformat()) if cal else None
+        if info:
+            if info.get("kind") == "holiday":
+                return None
+            mirror = int(info.get("mirror_weekday", -1) if info.get("mirror_weekday") is not None else -1)
+            if 0 <= mirror <= 6:
+                return mirror
+        return d.weekday()
+
+    def _occurrence_on(self, s, d: datetime.date, now: datetime.datetime, calendar=None):
+        """任务在日期 d 是否触发；返回触发时刻（可能早于 now，由调用方判断）"""
+        try:
+            parts = [int(x) for x in str(s["time_str"]).split(":")]
+        except ValueError:
+            return None
+        while len(parts) < 3:
+            parts.append(0)
+        h, mi, sec = parts[0], parts[1], parts[2]
+
+        eff = self._effective_weekday(d, calendar)
+        if eff is None:
+            return None
+
+        stype = s["schedule_type"]
+        if stype == "daily":
+            pass
+        elif stype == "weekly":
+            if not s["week_days"]:
+                return None
+            try:
+                days = [int(x) for x in str(s["week_days"]).split(",") if x != ""]
+            except ValueError:
+                return None
+            if eff not in days:
+                return None
+        elif stype in ("date", "once"):
+            if str(s["date_str"] or "") != d.isoformat():
+                return None
+        else:
+            return None
+
+        return datetime.datetime.combine(d, datetime.time(h, mi, sec))
+
+    def get_today_plan(self) -> list:
+        """今日剩余计划：[(datetime, 任务名, 任务id), ...]（供 GUI 预览，已排除放假与已过点）"""
+        now = datetime.datetime.now()
+        cal = self.db.get_calendar()
+        plan = []
+        for s in self.db.get_schedules(self.db.get_active_profile_id()):
+            if not s["enabled"]:
+                continue
+            t = self._occurrence_on(s, now.date(), now, cal)
+            if t is not None and t > now:
+                plan.append((t, s["name"], s["id"]))
+        plan.sort(key=lambda x: x[0])
+        return plan
 
     def _calculate_next(self, now: datetime.datetime, schedules: list) -> Tuple[Optional[datetime.datetime], Optional[dict]]:
-        """计算下一次执行时间和对应的任务"""
+        """计算下一次执行时间和对应的任务（V2.2：日历感知 —— 放假日跳过、调休补课日按映射星期）"""
         candidates = []
 
         for s in schedules:
@@ -453,49 +686,46 @@ class Scheduler:
             stype = s["schedule_type"]
 
             if stype == "daily":
-                # 每天
-                t = now.replace(hour=h, minute=m, second=sec, microsecond=0)
-                if t <= now:
-                    t += datetime.timedelta(days=1)
-                candidates.append((t, s))
-
-            elif stype == "weekly":
-                # 每周指定星期
-                if not s["week_days"]:
-                    continue
-                week_days = [int(x) for x in s["week_days"].split(",")]
-                for offset in range(14):  # 往后看14天
-                    t = now + datetime.timedelta(days=offset)
-                    t = t.replace(hour=h, minute=m, second=sec, microsecond=0)
-                    if t <= now:
+                # 每天（跳过放假日的整天）
+                for offset in range(0, 31):
+                    d = (now + datetime.timedelta(days=offset)).date()
+                    if self._effective_weekday(d) is None:
                         continue
-                    # Python weekday: Monday=0, Sunday=6
-                    if t.weekday() in week_days:
+                    t = datetime.datetime.combine(d, datetime.time(h, m, sec))
+                    if t > now:
                         candidates.append((t, s))
                         break
 
-            elif stype == "date":
-                # 指定日期
-                if not s["date_str"]:
+            elif stype == "weekly":
+                # 每周指定星期（调休补课日按映射星期匹配）
+                if not s["week_days"]:
                     continue
                 try:
-                    t = datetime.datetime.strptime(s["date_str"], "%Y-%m-%d")
-                    t = t.replace(hour=h, minute=m, second=sec, microsecond=0)
-                    if t > now:
-                        candidates.append((t, s))
-                except:
+                    week_days = [int(x) for x in str(s["week_days"]).split(",") if x != ""]
+                except ValueError:
                     continue
+                for offset in range(0, 31):
+                    d = (now + datetime.timedelta(days=offset)).date()
+                    eff = self._effective_weekday(d)
+                    if eff is None:
+                        continue
+                    t = datetime.datetime.combine(d, datetime.time(h, m, sec))
+                    if t <= now:
+                        continue
+                    if eff in week_days:
+                        candidates.append((t, s))
+                        break
 
-            elif stype == "once":
-                # 一次性
+            elif stype in ("date", "once"):
+                # 指定日期 / 一次性（放假日跳过）
                 if not s["date_str"]:
                     continue
                 try:
                     t = datetime.datetime.strptime(s["date_str"], "%Y-%m-%d")
                     t = t.replace(hour=h, minute=m, second=sec, microsecond=0)
-                    if t > now:
+                    if t > now and self._effective_weekday(t.date()) is not None:
                         candidates.append((t, s))
-                except:
+                except ValueError:
                     continue
 
         if not candidates:
@@ -514,80 +744,104 @@ class Scheduler:
                 time.sleep(10)
 
     def _schedule_round(self):
-        """单个调度回合：计算下一次、更新显示、等待、到点执行"""
-        self._resync.clear()
-        now = datetime.datetime.now()
-        active_profile = self.db.get_active_profile_id()
-        schedules = self.db.get_schedules(active_profile)
+        """单个调度回合：算下一次 → 按绝对时间等待 → 到点执行 / 记漏打 / 记暂停
 
+        V2.1 重写要点：
+        - 不再"累加 waited 秒数"，改为每轮比较绝对时间：系统时间被调整、进程被挂起、
+          笔记本睡眠唤醒后都不会错位（旧实现会长时间空转或提前触发）。
+        - 暂停不再"吞掉"任务：暂停期间到点的任务写入 logs(status='paused') 留痕，恢复后不补打。
+        - 到点容差可配置（默认 60 秒），超出容差记为 logs(status='missed')，不再只写文件日志。
+        """
+        self._resync.clear()
+        self._tolerance = max(5, int(load_settings().get("missed_tolerance_sec", 60) or 60))
+        self._calendar = self.db.get_calendar()
+
+        now = datetime.datetime.now()
+        schedules = self.db.get_schedules(self.db.get_active_profile_id())
         next_time, next_task = self._calculate_next(now, schedules)
 
         if next_time is None:
-            # 没有任务：清空显示，分段睡眠以便及时响应新增任务/暂停
-            self._next_dt = None
-            self._next_task_name = None
-            self._next_time = None
+            self._set_next(None, None)
             self._notify("no_schedule")
-            for _ in range(30):
-                if not self._running or self._resync.is_set():
-                    break
-                time.sleep(1)
+            self._wait_idle()
             return
 
-        # 更新显示信息（精确到具体时刻，供界面计算真实距离）
-        self._next_dt = next_time
-        self._next_task_name = next_task["name"] if next_task else ""
-        self._next_task_id = next_task["id"] if next_task else None
-        self._next_time = next_time.strftime("%H:%M:%S")
+        self._set_next(next_time, next_task)
         self._notify("next_time", time=self._next_time, dt=next_time, name=self._next_task_name)
 
-        # 计算等待秒数
-        wait_seconds = (next_time - now).total_seconds()
-        if wait_seconds <= 0:
-            wait_seconds = 1
+        last_check = time.monotonic()
+        while self._running:
+            now = datetime.datetime.now()
+            delta = (next_time - now).total_seconds()
 
-        # 等待，每秒检查；每5秒重新计算（应对任务新增/修改/停用）
-        waited = 0
-        while waited < wait_seconds and self._running:
-            if self._pause:
-                time.sleep(1)
-                waited += 1
-                continue
-            time.sleep(1)
-            waited += 1
+            if delta <= 0:
+                self._handle_due(next_task, -delta)
+                return
+
             if self._resync.is_set():
                 self._resync.clear()
                 return  # 数据已变化，重新规划
-            if waited % 5 == 0:
-                now2 = datetime.datetime.now()
-                # 距目标时间 <=6秒时不重算：此时重算会把到点的 daily 任务推到明天，
-                # 返回的下一个任务 id 变化导致误判 REPLAN，白等一轮（用户遇到的核心 bug）
-                if self._next_dt and (self._next_dt - now2).total_seconds() <= 6:
-                    continue
-                schedules2 = self.db.get_schedules(self.db.get_active_profile_id())
-                nt2, task2 = self._calculate_next(now2, schedules2)
-                if task2 is not None:
-                    # 同一任务（id相同）只是时间滚动到第二天，不触发 REPLAN
-                    same_task = task2["id"] == self._next_task_id
-                    if nt2 != self._next_dt and not same_task:
-                        return  # 计划有变化，重新调度
 
-        if not self._running or self._pause:
-            return
+            if time.monotonic() - last_check >= self.SAFETY_RECHECK and delta > 10:
+                last_check = time.monotonic()
+                if self._plan_changed(next_time):
+                    return  # 计划有变化，重新调度
 
-        # 执行打铃
+            # 远处按 1 秒轮询（与旧实现功耗相当），临近到点收紧到 0.2 秒以提高准点精度
+            if delta > 5:
+                time.sleep(self.POLL_INTERVAL)
+            else:
+                time.sleep(max(0.05, min(0.2, delta)))
+
+    def _wait_idle(self):
+        """无任务时的分片睡眠，及时响应新增任务 / 停止"""
+        for _ in range(60):
+            if not self._running or self._resync.is_set():
+                return
+            time.sleep(1)
+
+    def _plan_changed(self, current_next) -> bool:
+        """兜底重算：外部直接改库（未走 resync）时发现计划变化"""
+        self._calendar = self.db.get_calendar()
         now = datetime.datetime.now()
-        if abs((now - next_time).total_seconds()) <= 5:  # 5秒误差内
-            self._execute_task(next_task)
-        else:
-            logger.info(f"错过执行时间，跳过: {next_task['name']}")
+        schedules = self.db.get_schedules(self.db.get_active_profile_id())
+        nt, task = self._calculate_next(now, schedules)
+        if nt is None:
+            return True
+        task_id = _row_get(task, "id", None)
+        with self._state_lock:
+            current_id = self._next_task_id
+        if task_id == current_id and abs((nt - current_next).total_seconds()) < 1:
+            return False
+        # 只有"出现更早的任务"或"换成了另一个任务"才重排，避免同任务顺延被误判
+        return nt < current_next - datetime.timedelta(seconds=1) or task_id != current_id
 
-    def _execute_task(self, task: dict):
+    def _handle_due(self, task, late_seconds: float):
+        """到点处理：暂停 → 记 paused；超出容差 → 记 missed；否则执行"""
+        if self._pause:
+            self._record_skip(task, "paused", "暂停期间到点，已跳过（恢复后不补打）")
+            return
+        if late_seconds > self._tolerance:
+            self._record_skip(
+                task, "missed",
+                "延迟 %.0f 秒，超出容差 %d 秒（可能系统睡眠/进程挂起）" % (late_seconds, self._tolerance))
+            return
+        self._execute_task(task)
+
+    def _record_skip(self, task, status: str, reason: str):
+        """把"跳过/漏打"写进执行日志，保证事后可追溯"""
+        name = _row_get(task, "name", "")
+        audio = _row_get(task, "audio_file", "")
+        logger.warning("跳过打铃[%s]: %s → %s", status, name, reason)
+        self.db.add_log(_row_get(task, "id", 0), name, audio, status, reason)
+        self._notify("skipped", name=name, status=status, reason=reason)
+
+    def _execute_task(self, task):
         """执行一个打铃任务"""
-        name = task["name"]
-        audio = task["audio_file"]
-        volume = task["volume"]
-        play_count = task["play_count"]
+        name = _row_get(task, "name", "")
+        audio = _row_get(task, "audio_file", "")
+        volume = int(_row_get(task, "volume", 80) or 80)
+        play_count = int(_row_get(task, "play_count", 1) or 1)
 
         logger.info(f"🔔 执行打铃: {name} → {audio}")
 
@@ -597,16 +851,15 @@ class Scheduler:
         # 异步播放
         def on_play(result):
             status = "success" if result else "failed"
-            error = "" if result else "播放失败"
-            self.db.add_log(task["id"], name, audio, status, error)
+            error = "" if result else "播放失败（文件缺失 / 格式不支持 / 无音频设备）"
+            self.db.add_log(_row_get(task, "id", 0), name, audio, status, error)
+            # V2.1: 一次性任务改为"播放成功后才删除"，失败时保留以便重试
+            if result and _row_get(task, "schedule_type", "") == "once":
+                self.db.delete_schedule(_row_get(task, "id", 0))
+                logger.info(f"一次性任务已执行并删除: {name}")
             self._notify("ring_done", name=name, result=status)
 
         self.player.play_async(audio, volume, play_count, callback=on_play)
-
-        # 一次性任务执行后自动删除
-        if task["schedule_type"] == "once":
-            self.db.delete_schedule(task["id"])
-            logger.info(f"一次性任务已删除: {name}")
 
 
 # ============================================================
@@ -635,6 +888,9 @@ class BellApp:
         self.accent_color = "#2196F3"
         self.root.configure(bg=self.bg_color)
 
+        # V2.2: 列表排序状态 (列名, 是否倒序) 与今日预览刷新节拍
+        self._sort_state = ("time", False)
+        self._tick = 0
         self._build_ui()
         self._refresh_display()
         self._update_clock()
@@ -756,22 +1012,36 @@ class BellApp:
         list_frame = tk.Frame(root, bg=self.bg_color)
         list_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
 
-        # 标题行
-        tk.Label(list_frame, text="📋 打铃任务列表", font=("微软雅黑", 11, "bold"),
-                 bg=self.bg_color).pack(anchor=tk.W)
+        # 标题行 + 搜索框（V2.2）
+        title_row = tk.Frame(list_frame, bg=self.bg_color)
+        title_row.pack(fill=tk.X)
+        tk.Label(title_row, text="📋 打铃任务列表", font=("微软雅黑", 11, "bold"),
+                 bg=self.bg_color).pack(side=tk.LEFT)
+        tk.Label(title_row, text="搜索:", font=("微软雅黑", 9), bg=self.bg_color,
+                 fg="#666").pack(side=tk.LEFT, padx=(14, 2))
+        self._search_var = tk.StringVar()
+        search_entry = tk.Entry(title_row, textvariable=self._search_var, width=18,
+                                font=("微软雅黑", 9))
+        search_entry.pack(side=tk.LEFT)
+        self._search_var.trace_add("write", lambda *a: self._refresh_display())
+        tk.Button(title_row, text="清除", font=("微软雅黑", 8),
+                  command=lambda: self._search_var.set("")).pack(side=tk.LEFT, padx=4)
+
+        # 今日剩余计划预览（V2.2）
+        self._today_label = tk.Label(list_frame, text="今日剩余：—", anchor=tk.W,
+                                     font=("微软雅黑", 9), fg="#0b7a3b", bg=self.bg_color)
+        self._today_label.pack(fill=tk.X, pady=(3, 4))
 
         # Treeview
         columns = ("enabled", "time", "week", "name", "audio", "volume", "type")
         self._tree = ttk.Treeview(list_frame, columns=columns, show="headings",
                                    height=10, selectmode="browse")
 
-        self._tree.heading("enabled", text="启用")
-        self._tree.heading("time", text="时间")
-        self._tree.heading("week", text="星期")
-        self._tree.heading("name", text="任务名称")
-        self._tree.heading("audio", text="铃声文件")
-        self._tree.heading("volume", text="音量")
-        self._tree.heading("type", text="类型")
+        # V2.2: 点击表头排序（再点一次反向）
+        for col, text in (("enabled", "启用"), ("time", "时间"), ("week", "星期"),
+                          ("name", "任务名称"), ("audio", "铃声文件"),
+                          ("volume", "音量"), ("type", "类型")):
+            self._tree.heading(col, text=text, command=lambda c=col: self._sort_by(c))
 
         self._tree.column("enabled", width=50, anchor=tk.CENTER)
         self._tree.column("time", width=90, anchor=tk.CENTER)
@@ -802,6 +1072,10 @@ class BellApp:
         tk.Button(btn_frame, text="🔊 试听", font=("微软雅黑", 9),
                   command=self._play_selected).pack(side=tk.LEFT, padx=10)
 
+        tk.Button(btn_frame, text="📅 日历", font=("微软雅黑", 9),
+                  command=self._open_calendar).pack(side=tk.LEFT, padx=2)
+        tk.Button(btn_frame, text="📥 课表导入/导出", font=("微软雅黑", 9),
+                  command=self._open_io).pack(side=tk.LEFT, padx=2)
         tk.Button(btn_frame, text="📋 执行日志", font=("微软雅黑", 9),
                   command=self._show_logs).pack(side=tk.LEFT, padx=2)
         tk.Button(btn_frame, text="⚙ 系统设置", font=("微软雅黑", 9),
@@ -823,25 +1097,47 @@ class BellApp:
 
         schedules = self.db.get_schedules(active_id)
         week_map = {0: "一", 1: "二", 2: "三", 3: "四", 4: "五", 5: "六", 6: "日"}
+        stype_map = {"daily": "每天", "weekly": "每周", "date": "指定日期", "once": "一次性"}
 
+        keyword = ""
+        try:
+            keyword = (self._search_var.get() or "").strip().lower()
+        except Exception:
+            pass
+
+        col_index = {"enabled": 0, "time": 1, "week": 2, "name": 3,
+                     "audio": 4, "volume": 5, "type": 6}
+        rows = []
         for s in schedules:
             enabled = "✓" if s["enabled"] else "☐"
-            stype_map = {"daily": "每天", "weekly": "每周", "date": "指定日期", "once": "一次性"}
             stype = stype_map.get(s["schedule_type"], s["schedule_type"])
 
             week_str = ""
             if s["schedule_type"] == "weekly" and s["week_days"]:
                 days = [week_map.get(int(x), "?") for x in s["week_days"].split(",")]
                 week_str = "周" + "、".join(days)
-            elif s["schedule_type"] == "date" and s["date_str"]:
-                week_str = s["date_str"]
-            elif s["schedule_type"] == "once" and s["date_str"]:
+            elif s["schedule_type"] in ("date", "once") and s["date_str"]:
                 week_str = s["date_str"]
 
-            self._tree.insert("", tk.END, iid=str(s["id"]), values=(
-                enabled, s["time_str"], week_str, s["name"],
-                Path(s["audio_file"]).name, f"{s['volume']}%", stype
-            ))
+            audio_name = Path(s["audio_file"]).name
+            if keyword:
+                haystack = " ".join([str(s["name"]), str(s["time_str"]),
+                                     str(week_str), audio_name, stype]).lower()
+                if keyword not in haystack:
+                    continue
+
+            rows.append((s, (enabled, s["time_str"], week_str, s["name"],
+                             audio_name, f"{s['volume']}%", stype)))
+
+        # V2.2: 按表头排序（时间列用字符串比较即可，HH:MM:SS 定长）
+        sort_col, reverse = self._sort_state
+        idx = col_index.get(sort_col, 1)
+        rows.sort(key=lambda r: str(r[1][idx]), reverse=reverse)
+
+        for s, values in rows:
+            self._tree.insert("", tk.END, iid=str(s["id"]), values=values)
+
+        self._refresh_today_plan()
 
     def _on_tree_click(self, event):
         """点击树形列表中的启用列切换状态"""
@@ -893,6 +1189,11 @@ class BellApp:
             self._next_date_label.config(text="")
             self._next_dist_label.config(text="暂无任务")
 
+        # V2.2: 每 30 秒刷新一次今日剩余计划
+        self._tick = (self._tick + 1) % 30
+        if self._tick == 0:
+            self._refresh_today_plan()
+
         self.root.after(1000, self._update_clock)
 
     def _on_scheduler_event(self, event: str, **kwargs):
@@ -904,6 +1205,16 @@ class BellApp:
             name = kwargs.get("name", "")
             logger.info(f"🔔 正在打铃: {name}")
         elif event == "ring_done":
+            if kwargs.get("result") != "success":
+                # V2.2: 打铃失败要能"被人看见"，不能只躺在日志里
+                self._notify_tray("⚠ 打铃失败", "「%s」播放失败，请检查铃声文件与音频设备"
+                                  % kwargs.get("name", ""))
+            self._refresh_display()
+        elif event == "skipped":
+            # V2.1: 暂停跳过 / 漏打（超出容差）都会走到这里，刷新列表让用户看到留痕
+            if kwargs.get("status") == "missed":
+                self._notify_tray("⚠ 漏打提醒",
+                                  "「%s」延迟超出容差，已记为漏打" % kwargs.get("name", ""))
             self._refresh_display()
         elif event == "no_schedule":
             self._next_time_label.config(text="--:--:--")
@@ -918,6 +1229,46 @@ class BellApp:
         except Exception:
             pass
 
+    # ---- V2.2 列表交互 ----
+    def _sort_by(self, col):
+        """点击表头：同列再点一次切换升降序"""
+        cur, reverse = self._sort_state
+        self._sort_state = (col, (not reverse) if cur == col else False)
+        self._refresh_display()
+
+    def _refresh_today_plan(self):
+        """刷新"今日剩余"预览"""
+        try:
+            plan = self.scheduler.get_today_plan()
+        except Exception as e:
+            logger.warning("计算今日计划失败: %s", e)
+            plan = []
+        try:
+            if not plan:
+                self._today_label.config(text="今日剩余：无（已全部执行或今日放假）")
+                return
+            items = ["%s %s" % (dt.strftime("%H:%M"), name) for dt, name, _sid in plan[:4]]
+            more = "" if len(plan) <= 4 else " 等 %d 项" % len(plan)
+            self._today_label.config(text="今日剩余 %d 次：%s%s" % (len(plan), "、".join(items), more))
+        except Exception:
+            pass
+
+    def _notify_tray(self, title, message):
+        """托盘气泡告警（无托盘则退化为写日志）"""
+        logger.warning("%s: %s", title, message)
+        if not self._tray:
+            return
+        try:
+            self._tray.notify(message, title)
+        except Exception:
+            pass
+
+    def _open_calendar(self):
+        CalendarDialog(self.root, self.db, self._after_task_change)
+
+    def _open_io(self):
+        ScheduleIODialog(self.root, self.db, self._after_task_change)
+
     # ---- 任务操作 ----
     def _add_schedule(self):
         ScheduleDialog(self.root, self.db, self._after_task_change)
@@ -928,7 +1279,7 @@ class BellApp:
             messagebox.showinfo("提示", "请先选择一个任务")
             return
         sid = int(selected[0])
-        row = self.db.conn.execute("SELECT * FROM schedules WHERE id=?", (sid,)).fetchone()
+        row = self.db.get_schedule(sid)
         if row:
             ScheduleDialog(self.root, self.db, self._after_task_change, row)
 
@@ -949,7 +1300,7 @@ class BellApp:
             messagebox.showinfo("提示", "请先选择一个任务")
             return
         sid = int(selected[0])
-        row = self.db.conn.execute("SELECT * FROM schedules WHERE id=?", (sid,)).fetchone()
+        row = self.db.get_schedule(sid)
         if row:
             self.player.play_async(row["audio_file"], row["volume"], 1)
 
@@ -972,9 +1323,13 @@ class BellApp:
             return
 
         def play_all():
-            for s in enabled:
-                logger.info(f"立即打铃: {s['name']}")
-                self.player.play(s["audio_file"], s["volume"], s["play_count"])
+            # V2.1: 走 play_many，"停止播放"可整体打断整个序列（旧实现下一曲会继续响）
+            played = self.player.play_many(
+                enabled,
+                on_item=lambda s, ok: logger.info(
+                    "立即打铃: %s (%s)", _row_get(s, "name", ""), "成功" if ok else "失败"))
+            logger.info("立即打铃结束，实际播放 %d 条", played)
+
         threading.Thread(target=play_all, daemon=True).start()
 
     # ---- 方案管理 ----
@@ -1010,19 +1365,27 @@ class BellApp:
             self._update_web_label(None)
             return
         try:
+            self._web_token = str(settings.get("web_token") or "")
             self._web = BellWebServer(
                 self.db, self.player, self.scheduler,
                 port=int(settings.get("web_port") or 8787),
-                token=str(settings.get("web_token") or ""),
+                token=self._web_token,
                 on_change=lambda: self._web_events.put(1))
             self._web.start()
             urls = self._web.get_urls()
             logger.info("🌐 远程控制地址: %s", " , ".join(urls))
+            if not self._web_token:
+                logger.warning("⚠ 远程控制未设置访问令牌：同一局域网内任何设备都能操作打铃")
             self._update_web_label(urls[0])
             if show_error and urls:
+                extra = ""
+                if not self._web_token:
+                    extra = ("\n\n⚠ 安全提示：当前未设置访问令牌，同一局域网内"
+                             "任何人都能打开此页面并操作打铃。\n"
+                             "建议在「系统设置 → 访问令牌」中设置一个令牌。")
                 messagebox.showinfo(
                     "远程控制已启动",
-                    "同一局域网内的手机/电脑用浏览器打开：\n\n" + "\n".join(urls),
+                    "同一局域网内的手机/电脑用浏览器打开：\n\n" + "\n".join(urls) + extra,
                     parent=self.root)
         except OSError as e:
             self._web = None
@@ -1052,7 +1415,12 @@ class BellApp:
 
     def _update_web_label(self, url):
         try:
-            self._web_label.config(text=f"🌐 远程控制: {url}" if url else "")
+            if not url:
+                self._web_label.config(text="")
+                return
+            # V2.1: 未设置访问令牌时在状态栏持续提示（局域网内任何人可操作）
+            warn = "  ⚠ 未设令牌" if not getattr(self, "_web_token", "") else ""
+            self._web_label.config(text=f"🌐 远程控制: {url}{warn}")
         except Exception:
             pass
 
@@ -1069,28 +1437,36 @@ class BellApp:
             return
 
         def create_image():
+            # V2.1: 优先用 bell.ico（PIL 默认位图字体画不出 emoji，旧图标实际是空白/方块）
+            try:
+                ico = APP_DIR / "bell.ico"
+                if ico.exists():
+                    return Image.open(ico).convert("RGBA")
+            except Exception:
+                pass
             img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
             draw = ImageDraw.Draw(img)
             draw.ellipse([8, 8, 56, 56], fill="#FF9800")
-            draw.text((20, 18), "🔔", font=None, fill="white")
+            draw.rectangle([26, 16, 38, 40], fill="white")
+            draw.ellipse([20, 34, 44, 48], fill="white")
             return img
 
+        # V2.1: pystray 的回调跑在它自己的线程里，而 Tk 不是线程安全的。
+        # 所有界面操作必须 post 回主线程，否则会随机崩溃/卡死。
         def on_open(icon, item):
-            self._show_window()
+            self._post_ui(self._show_window)
 
         def on_quit(icon, item):
-            icon.stop()
-            self.root.quit()
-            os._exit(0)
+            self._post_ui(self._quit_app)
 
         menu = pystray.Menu(
             pystray.MenuItem("打开主界面", on_open, default=True),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem("立即打铃", lambda: self._immediate_ring()),
-            pystray.MenuItem("暂停打铃", lambda: self.scheduler.pause()),
-            pystray.MenuItem("恢复打铃", lambda: self.scheduler.resume()),
+            pystray.MenuItem("立即打铃", lambda: self._post_ui(self._immediate_ring)),
+            pystray.MenuItem("暂停打铃", lambda: self._post_ui(self.scheduler.pause)),
+            pystray.MenuItem("恢复打铃", lambda: self._post_ui(self.scheduler.resume)),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem("打开网页控制台", lambda: self._open_web_ui()),
+            pystray.MenuItem("打开网页控制台", lambda: self._post_ui(self._open_web_ui)),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("退出", on_quit),
         )
@@ -1098,25 +1474,213 @@ class BellApp:
         self._tray = pystray.Icon("BellSystem", create_image(), "智能打铃系统", menu)
         threading.Thread(target=self._tray.run, daemon=True).start()
 
+    def _post_ui(self, fn, *args, **kwargs):
+        """把任意线程的界面操作投递到 Tk 主线程（托盘线程/后台线程必须走这里）"""
+        try:
+            self.root.after(0, lambda: fn(*args, **kwargs))
+        except Exception:
+            pass
+
     def _show_window(self):
-        self.root.deiconify()
-        self.root.lift()
+        try:
+            self.root.deiconify()
+            self.root.state("normal")
+            self.root.lift()
+            self.root.focus_force()
+        except Exception:
+            pass
 
     def _minimize_to_tray(self):
         self.root.withdraw()
 
-    def _on_close(self):
-        """关闭窗口时最小化到托盘"""
+    def _quit_app(self):
+        """退出：停托盘 + 退出主循环；资源清理统一在 main() 里做（不再 os._exit 硬杀）"""
         if self._tray:
+            try:
+                self._tray.stop()
+            except Exception:
+                pass
+            self._tray = None
+        self.root.quit()
+
+    def _on_close(self):
+        """关闭窗口：按设置决定最小化到托盘还是退出"""
+        try:
+            to_tray = bool(load_settings().get("minimize_to_tray", True))
+        except Exception:
+            to_tray = True
+        # V2.1: 旧实现无视"最小化到托盘"设置项，只要托盘存在就隐藏
+        if self._tray and to_tray:
             self._minimize_to_tray()
         else:
-            self.root.quit()
+            self._quit_app()
 
     def _bind_shortcuts(self):
         self.root.bind("<Escape>", lambda e: self._minimize_to_tray())
 
     def run(self):
         self.root.mainloop()
+
+
+# ============================================================
+# 课表 CSV 导入 / 导出（V2.2）
+# ============================================================
+CSV_HEADER = ["任务名称", "重复方式", "时间", "星期", "日期", "铃声文件", "音量", "次数", "启用"]
+TYPE_TO_CN = {"daily": "每天", "weekly": "每周", "date": "指定日期", "once": "一次性"}
+CN_TO_TYPE = {v: k for k, v in TYPE_TO_CN.items()}
+
+
+def _parse_week_days(text: str) -> str:
+    """把 "0,2,4" / "一,三,五" / "周一,周三" / "1,3,5"(1-7) 统一成 "0,2,4" """
+    text = (text or "").strip()
+    if not text:
+        return ""
+    cn = {"一": 0, "二": 1, "三": 2, "四": 3, "五": 4, "六": 5, "日": 6, "天": 6}
+    out = set()
+    nums = []
+    for part in text.replace("，", ",").replace("、", ",").replace(" ", ",").split(","):
+        part = part.strip().lstrip("周")
+        if not part:
+            continue
+        if part in cn:
+            out.add(cn[part])
+            continue
+        try:
+            nums.append(int(part))
+        except ValueError:
+            return None
+    if nums:
+        # 数字默认按 0-6（周一=0，与导出格式一致，保证 round-trip）；
+        # 只有当出现 7 时才按 1-7（周一=1，周日=7）解释。
+        one_based = 7 in nums
+        for n in nums:
+            if one_based:
+                n -= 1
+            if not (0 <= n <= 6):
+                return None
+            out.add(n)
+    return ",".join(str(d) for d in sorted(out))
+
+
+def export_schedules_csv(db: Database, path: str, profile_id: int = 0) -> int:
+    """导出当前方案课表到 CSV（UTF-8 BOM，Excel 直接打开不乱码），返回条数"""
+    import csv
+    rows = db.get_schedules(profile_id or db.get_active_profile_id())
+    with open(path, "w", encoding="utf-8-sig", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(CSV_HEADER)
+        for s in rows:
+            w.writerow([
+                s["name"], TYPE_TO_CN.get(s["schedule_type"], s["schedule_type"]),
+                s["time_str"], s["week_days"] or "", s["date_str"] or "",
+                s["audio_file"], s["volume"], s["play_count"],
+                "是" if s["enabled"] else "否",
+            ])
+    return len(rows)
+
+
+def import_schedules_csv(db: Database, path: str, profile_id: int = 0):
+    """从 CSV 批量建任务，返回 (成功数, 错误列表, 警告列表)"""
+    import csv
+    ok, errors, warnings = 0, [], []
+    target_pid = profile_id or db.get_active_profile_id()
+    with open(path, "r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+        if not reader.fieldnames or "任务名称" not in reader.fieldnames:
+            return 0, ["表头不正确：第一行必须是 " + ",".join(CSV_HEADER)], []
+        for idx, row in enumerate(reader, start=2):
+            try:
+                name = (row.get("任务名称") or "").strip()
+                if not name:
+                    errors.append("第%d行：任务名称为空" % idx)
+                    continue
+                stype = CN_TO_TYPE.get((row.get("重复方式") or "").strip(), None)
+                if stype is None:
+                    stype = (row.get("重复方式") or "").strip().lower()
+                if stype not in ("daily", "weekly", "date", "once"):
+                    errors.append("第%d行：重复方式无法识别（应为 每天/每周/指定日期/一次性）" % idx)
+                    continue
+                tstr = (row.get("时间") or "").strip()
+                try:
+                    parts = [int(x) for x in tstr.split(":")]
+                except ValueError:
+                    errors.append("第%d行：时间格式错误（应为 HH:MM 或 HH:MM:SS）" % idx)
+                    continue
+                while len(parts) < 3:
+                    parts.append(0)
+                if not (0 <= parts[0] <= 23 and 0 <= parts[1] <= 59 and 0 <= parts[2] <= 59):
+                    errors.append("第%d行：时间数值超出范围" % idx)
+                    continue
+                week_days = _parse_week_days(row.get("星期") or "")
+                if week_days is None:
+                    errors.append("第%d行：星期无法识别（如 0,2,4 或 一,三,五）" % idx)
+                    continue
+                date_str = (row.get("日期") or "").strip()
+                if stype in ("date", "once"):
+                    try:
+                        datetime.datetime.strptime(date_str, "%Y-%m-%d")
+                    except ValueError:
+                        errors.append("第%d行：日期格式错误（应为 YYYY-MM-DD）" % idx)
+                        continue
+                if stype == "weekly" and not week_days:
+                    errors.append("第%d行：每周任务必须填星期" % idx)
+                    continue
+                audio = (row.get("铃声文件") or "").strip()
+                if not audio:
+                    errors.append("第%d行：铃声文件为空" % idx)
+                    continue
+                if not Path(audio).exists():
+                    warnings.append("第%d行：铃声不存在，已导入但需修正 → %s" % (idx, audio))
+                try:
+                    volume = max(0, min(100, int(float(row.get("音量") or 80))))
+                except ValueError:
+                    volume = 80
+                try:
+                    count = max(1, min(10, int(float(row.get("次数") or 1))))
+                except ValueError:
+                    count = 1
+                enabled = (row.get("启用") or "是").strip() in ("是", "1", "true", "True", "Y", "y", "")
+                db.add_schedule({
+                    "name": name, "schedule_type": stype,
+                    "time_str": "%02d:%02d:%02d" % (parts[0], parts[1], parts[2]),
+                    "week_days": week_days, "date_str": date_str,
+                    "audio_file": audio, "volume": volume, "play_count": count,
+                    "enabled": 1 if enabled else 0, "profile_id": target_pid,
+                })
+                ok += 1
+            except Exception as e:
+                errors.append("第%d行：%s" % (idx, e))
+    return ok, errors, warnings
+
+
+# ============================================================
+# 任务数据组装（GUI 与 Web 共用语义，便于单测）
+# ============================================================
+def build_schedule_payload(name, schedule_type, time_str, week_days="", date_str="",
+                           audio_file="", volume=80, play_count=1, enabled=1,
+                           base=None, active_profile_id=0):
+    """组装写入数据库的任务字典。
+
+    base 为编辑前的原始行（sqlite3.Row / dict）：
+      - 未在界面上修改的字段（如 profile_id）沿用原值，避免"编辑一次就被改写"；
+      - 新建时 profile_id 取当前活动方案。
+    """
+    if base is not None:
+        profile_id = _row_get(base, "profile_id", active_profile_id)
+    else:
+        profile_id = active_profile_id
+    return {
+        "name": name,
+        "schedule_type": schedule_type,
+        "time_str": time_str,
+        "week_days": week_days,
+        "date_str": date_str,
+        "audio_file": audio_file,
+        "volume": max(0, min(100, int(volume))),
+        "play_count": max(1, min(10, int(play_count))),
+        "enabled": 1 if enabled else 0,
+        "profile_id": int(profile_id or 0),
+    }
 
 
 # ============================================================
@@ -1234,6 +1798,16 @@ class ScheduleDialog:
         self._vol_label.pack(side=tk.LEFT, padx=5)
         self._volume.config(command=lambda v: self._vol_label.config(text=f"{int(v)}%"))
 
+        # 重复次数（V2.1: 之前 Web 端可设 1~10 次，GUI 一保存就被重置为 1）
+        tk.Label(d, text="重复次数:", font=("微软雅黑", 10)).pack(anchor=tk.W, **pad)
+        count_frame = tk.Frame(d)
+        count_frame.pack(fill=tk.X, **pad)
+        self._play_count = tk.Spinbox(count_frame, from_=1, to=10, width=5,
+                                      font=("微软雅黑", 10), justify=tk.CENTER)
+        self._play_count.pack(side=tk.LEFT)
+        tk.Label(count_frame, text="次（连续播放，1~10）", font=("微软雅黑", 9),
+                 fg="#888").pack(side=tk.LEFT, padx=6)
+
         # 启用
         self._enabled_var = tk.BooleanVar(value=True)
         tk.Checkbutton(d, text="启用", variable=self._enabled_var,
@@ -1291,6 +1865,8 @@ class ScheduleDialog:
         self._audio_file.insert(0, self.data["audio_file"])
         self._volume.set(self.data["volume"])
         self._vol_label.config(text=f"{self.data['volume']}%")
+        self._play_count.delete(0, tk.END)
+        self._play_count.insert(0, str(self.data["play_count"] or 1))
         self._enabled_var.set(bool(self.data["enabled"]))
 
     def _save(self):
@@ -1331,18 +1907,21 @@ class ScheduleDialog:
                 messagebox.showwarning("警告", "日期格式错误，请使用 YYYY-MM-DD", parent=self.dialog)
                 return
 
-        data = {
-            "name": name,
-            "schedule_type": stype,
-            "time_str": time_str,
-            "week_days": week_days,
-            "date_str": date_str,
-            "audio_file": audio,
-            "volume": int(self._volume.get()),
-            "play_count": 1,
-            "enabled": 1 if self._enabled_var.get() else 0,
-            "profile_id": self.db.get_active_profile_id(),
-        }
+        # V2.1: 编辑时以原始行为基底，只覆盖界面上真正可改的字段。
+        # 旧实现把 play_count 硬编码为 1、把 profile_id 强制改成当前方案，
+        # 导致"Web 设的播放次数被 GUI 重置"和"公共任务被私有化"两个数据丢失问题。
+        try:
+            play_count = max(1, min(10, int(float(self._play_count.get()))))
+        except (TypeError, ValueError):
+            play_count = 1
+
+        data = build_schedule_payload(
+            name=name, schedule_type=stype, time_str=time_str,
+            week_days=week_days, date_str=date_str, audio_file=audio,
+            volume=int(self._volume.get()), play_count=play_count,
+            enabled=1 if self._enabled_var.get() else 0,
+            base=self.data,
+            active_profile_id=self.db.get_active_profile_id())
 
         if self.edit_mode:
             self.db.update_schedule(self.data["id"], data)
@@ -1437,12 +2016,214 @@ class ProfileDialog:
 # 日志对话框
 # ============================================================
 class LogDialog:
+    STATUS_TEXT = {
+        "success": "✅ 成功",
+        "failed": "❌ 失败",
+        "missed": "⏰ 漏打",
+        "paused": "⏸ 暂停跳过",
+    }
+
     def __init__(self, parent, db):
         self.db = db
 
         self.dialog = tk.Toplevel(parent)
         self.dialog.title("执行日志")
-        self.dialog.geometry("700x400")
+        self.dialog.geometry("760x420")
+        self.dialog.transient(parent)
+        self.dialog.grab_set()
+
+        self._filter_var = tk.StringVar(value="全部")
+        self._build_ui()
+        self._reload()
+        self.dialog.wait_window()
+
+    def _build_ui(self):
+        d = self.dialog
+        tk.Label(d, text="📋 执行日志", font=("微软雅黑", 12, "bold")).pack(pady=5)
+
+        # V2.2: 状态筛选 + 导出 CSV
+        top = tk.Frame(d)
+        top.pack(fill=tk.X, padx=10)
+        tk.Label(top, text="状态筛选:", font=("微软雅黑", 9)).pack(side=tk.LEFT)
+        combo = ttk.Combobox(top, textvariable=self._filter_var, state="readonly", width=12,
+                             values=["全部", "成功", "失败", "漏打", "暂停跳过"],
+                             font=("微软雅黑", 9))
+        combo.pack(side=tk.LEFT, padx=6)
+        combo.bind("<<ComboboxSelected>>", lambda e: self._reload())
+        tk.Button(top, text="导出 CSV", command=self._export).pack(side=tk.RIGHT, padx=2)
+
+        columns = ("time", "name", "audio", "status", "detail")
+        self._tree = ttk.Treeview(d, columns=columns, show="headings", height=15)
+        for col, text, width in (("time", "执行时间", 160), ("name", "任务名称", 140),
+                                 ("audio", "铃声文件", 190), ("status", "状态", 90),
+                                 ("detail", "说明", 190)):
+            self._tree.heading(col, text=text)
+            self._tree.column(col, width=width,
+                              anchor=tk.CENTER if col in ("status",) else tk.W)
+
+        scrollbar = ttk.Scrollbar(d, orient=tk.VERTICAL, command=self._tree.yview)
+        self._tree.configure(yscrollcommand=scrollbar.set)
+        self._tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=10, pady=5)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y, pady=5)
+
+        tk.Button(d, text="关闭", command=self.dialog.destroy).pack(pady=5)
+
+    def _rows(self):
+        want = self._filter_var.get()
+        key = {"成功": "success", "失败": "failed", "漏打": "missed", "暂停跳过": "paused"}.get(want)
+        rows = self.db.get_logs(500)
+        if key:
+            rows = [r for r in rows if r["status"] == key]
+        return rows
+
+    def _reload(self):
+        for item in self._tree.get_children():
+            self._tree.delete(item)
+        for log in self._rows():
+            self._tree.insert("", tk.END, values=(
+                log["execute_time"], log["schedule_name"],
+                Path(log["audio_file"] or "").name,
+                self.STATUS_TEXT.get(log["status"], log["status"]),
+                log["error_message"] or ""
+            ))
+
+    def _export(self):
+        path = filedialog.asksaveasfilename(
+            title="导出执行日志", defaultextension=".csv",
+            initialfile="bell_logs_%s.csv" % datetime.date.today().isoformat(),
+            filetypes=[("CSV 文件", "*.csv"), ("所有文件", "*.*")])
+        if not path:
+            return
+        try:
+            import csv
+            rows = self._rows()
+            with open(path, "w", encoding="utf-8-sig", newline="") as f:
+                w = csv.writer(f)
+                w.writerow(["执行时间", "任务名称", "铃声文件", "状态", "说明"])
+                for log in rows:
+                    w.writerow([log["execute_time"], log["schedule_name"], log["audio_file"],
+                                self.STATUS_TEXT.get(log["status"], log["status"]),
+                                log["error_message"] or ""])
+            messagebox.showinfo("导出完成", "已导出 %d 条日志到：\n%s" % (len(rows), path),
+                                parent=self.dialog)
+        except Exception as e:
+            messagebox.showerror("导出失败", str(e), parent=self.dialog)
+
+
+# ============================================================
+# 日历（节假日 / 调休补课）对话框 —— V2.2
+# ============================================================
+class CalendarDialog:
+    KIND_TEXT = {"holiday": "放假（全天不打铃）", "workday": "上课（照常打铃）"}
+
+    def __init__(self, parent, db, on_save):
+        self.db = db
+        self.on_save = on_save
+
+        self.dialog = tk.Toplevel(parent)
+        self.dialog.title("节假日 / 调休日历")
+        self.dialog.geometry("560x480")
+        self.dialog.transient(parent)
+        self.dialog.grab_set()
+
+        self._build_ui()
+        self._reload()
+        self.dialog.wait_window()
+
+    def _build_ui(self):
+        d = self.dialog
+        tk.Label(d, text="📅 节假日 / 调休日历", font=("微软雅黑", 12, "bold")).pack(pady=8)
+        tk.Label(d, text="放假：该日全天不打铃　|　上课：该日照常打铃，可指定「按星期几的课表」（调休补课）",
+                 font=("微软雅黑", 8), fg="#888").pack(anchor=tk.W, padx=12)
+
+        form = tk.Frame(d)
+        form.pack(fill=tk.X, padx=12, pady=6)
+
+        row1 = tk.Frame(form)
+        row1.pack(fill=tk.X, pady=2)
+        tk.Label(row1, text="日期:", font=("微软雅黑", 9)).pack(side=tk.LEFT)
+        self._day_var = tk.StringVar(value=datetime.date.today().isoformat())
+        tk.Entry(row1, textvariable=self._day_var, width=12, font=("微软雅黑", 9)).pack(side=tk.LEFT, padx=4)
+        tk.Label(row1, text="(YYYY-MM-DD)", font=("微软雅黑", 8), fg="#999").pack(side=tk.LEFT)
+
+        row2 = tk.Frame(form)
+        row2.pack(fill=tk.X, pady=2)
+        self._kind_var = tk.StringVar(value="holiday")
+        tk.Radiobutton(row2, text="放假（不打铃）", variable=self._kind_var, value="holiday",
+                       font=("微软雅黑", 9)).pack(side=tk.LEFT)
+        tk.Radiobutton(row2, text="上课（照常打铃）", variable=self._kind_var, value="workday",
+                       font=("微软雅黑", 9)).pack(side=tk.LEFT, padx=8)
+
+        row3 = tk.Frame(form)
+        row3.pack(fill=tk.X, pady=2)
+        tk.Label(row3, text="按星期:", font=("微软雅黑", 9)).pack(side=tk.LEFT)
+        self._mirror_var = tk.StringVar(value="不指定")
+        ttk.Combobox(row3, textvariable=self._mirror_var, state="readonly", width=10,
+                     values=["不指定", "周一", "周二", "周三", "周四", "周五", "周六", "周日"],
+                     font=("微软雅黑", 9)).pack(side=tk.LEFT, padx=4)
+        tk.Label(row3, text="备注:", font=("微软雅黑", 9)).pack(side=tk.LEFT, padx=(8, 0))
+        self._note_var = tk.StringVar()
+        tk.Entry(row3, textvariable=self._note_var, width=16, font=("微软雅黑", 9)).pack(side=tk.LEFT, padx=4)
+
+        btns = tk.Frame(d)
+        btns.pack(fill=tk.X, padx=12, pady=4)
+        tk.Button(btns, text="➕ 添加/覆盖", command=self._add).pack(side=tk.LEFT, padx=2)
+        tk.Button(btns, text="🗑 删除选中", command=self._delete).pack(side=tk.LEFT, padx=2)
+        tk.Button(btns, text="关闭", command=self.dialog.destroy).pack(side=tk.RIGHT, padx=2)
+
+        self._listbox = tk.Listbox(d, font=("微软雅黑", 9), height=12)
+        self._listbox.pack(fill=tk.BOTH, expand=True, padx=12, pady=6)
+
+    def _reload(self):
+        self._listbox.delete(0, tk.END)
+        self._days = []
+        cal = self.db.get_calendar()
+        for day in sorted(cal.keys()):
+            info = cal[day]
+            self._days.append(day)
+            kind = self.KIND_TEXT.get(info["kind"], info["kind"])
+            mirror = ""
+            if info["kind"] == "workday" and 0 <= info.get("mirror_weekday", -1) <= 6:
+                mirror = " · 按周%s" % "一二三四五六日"[info["mirror_weekday"]]
+            note = (" · " + info["note"]) if info.get("note") else ""
+            self._listbox.insert(tk.END, "%s  %s%s%s" % (day, kind, mirror, note))
+
+    def _add(self):
+        day = (self._day_var.get() or "").strip()
+        try:
+            datetime.datetime.strptime(day, "%Y-%m-%d")
+        except ValueError:
+            messagebox.showwarning("日期格式错误", "请使用 YYYY-MM-DD", parent=self.dialog)
+            return
+        mirror = ["不指定", "周一", "周二", "周三", "周四", "周五", "周六", "周日"].index(
+            self._mirror_var.get() or "不指定") - 1
+        self.db.set_calendar_day(day, self._kind_var.get(), mirror, (self._note_var.get() or "").strip())
+        self._reload()
+        self.on_save()
+
+    def _delete(self):
+        sel = self._listbox.curselection()
+        if not sel:
+            return
+        day = self._days[sel[0]]
+        if not messagebox.askyesno("确认", "删除 %s 的日历设置？" % day, parent=self.dialog):
+            return
+        self.db.delete_calendar_day(day)
+        self._reload()
+        self.on_save()
+
+
+# ============================================================
+# 课表 CSV 导入 / 导出对话框 —— V2.2
+# ============================================================
+class ScheduleIODialog:
+    def __init__(self, parent, db, on_save):
+        self.db = db
+        self.on_save = on_save
+
+        self.dialog = tk.Toplevel(parent)
+        self.dialog.title("课表导入 / 导出")
+        self.dialog.geometry("620x460")
         self.dialog.transient(parent)
         self.dialog.grab_set()
 
@@ -1451,32 +2232,55 @@ class LogDialog:
 
     def _build_ui(self):
         d = self.dialog
-        tk.Label(d, text="📋 执行日志", font=("微软雅黑", 12, "bold")).pack(pady=5)
+        tk.Label(d, text="📥 课表导入 / 导出（CSV）", font=("微软雅黑", 12, "bold")).pack(pady=8)
+        tk.Label(d, text="CSV 用 Excel 可直接打开（UTF-8 BOM，不乱码）。列：%s"
+                 % ",".join(CSV_HEADER), font=("微软雅黑", 8), fg="#888").pack(anchor=tk.W, padx=12)
+        tk.Label(d, text="星期可写 0,2,4 或 一,三,五；导入一律进入「当前方案」。",
+                 font=("微软雅黑", 8), fg="#888").pack(anchor=tk.W, padx=12, pady=(0, 6))
 
-        columns = ("time", "name", "audio", "status")
-        tree = ttk.Treeview(d, columns=columns, show="headings", height=15)
-        tree.heading("time", text="执行时间")
-        tree.heading("name", text="任务名称")
-        tree.heading("audio", text="铃声文件")
-        tree.heading("status", text="状态")
-        tree.column("time", width=170)
-        tree.column("name", width=150)
-        tree.column("audio", width=250)
-        tree.column("status", width=80, anchor=tk.CENTER)
+        btns = tk.Frame(d)
+        btns.pack(fill=tk.X, padx=12)
+        tk.Button(btns, text="📤 导出当前方案", command=self._export).pack(side=tk.LEFT, padx=2)
+        tk.Button(btns, text="📥 从 CSV 导入", command=self._import).pack(side=tk.LEFT, padx=2)
+        tk.Button(btns, text="关闭", command=self.dialog.destroy).pack(side=tk.RIGHT, padx=2)
 
-        scrollbar = ttk.Scrollbar(d, orient=tk.VERTICAL, command=tree.yview)
-        tree.configure(yscrollcommand=scrollbar.set)
-        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=10, pady=5)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y, pady=5)
+        self._text = tk.Text(d, font=("Consolas", 9), wrap=tk.WORD)
+        self._text.pack(fill=tk.BOTH, expand=True, padx=12, pady=8)
 
-        for log in self.db.get_logs(200):
-            status_text = "✅ 成功" if log["status"] == "success" else "❌ 失败"
-            tree.insert("", tk.END, values=(
-                log["execute_time"], log["schedule_name"],
-                Path(log["audio_file"]).name, status_text
-            ))
+    def _log(self, msg):
+        self._text.insert(tk.END, msg + "\n")
+        self._text.see(tk.END)
 
-        tk.Button(d, text="关闭", command=self.dialog.destroy).pack(pady=5)
+    def _export(self):
+        path = filedialog.asksaveasfilename(
+            title="导出课表", defaultextension=".csv",
+            initialfile="bell_schedule_%s.csv" % datetime.date.today().isoformat(),
+            filetypes=[("CSV 文件", "*.csv"), ("所有文件", "*.*")])
+        if not path:
+            return
+        try:
+            n = export_schedules_csv(self.db, path)
+            self._log("✅ 已导出 %d 条任务 → %s" % (n, path))
+        except Exception as e:
+            self._log("❌ 导出失败：%s" % e)
+
+    def _import(self):
+        path = filedialog.askopenfilename(
+            title="选择课表 CSV", filetypes=[("CSV 文件", "*.csv"), ("所有文件", "*.*")])
+        if not path:
+            return
+        try:
+            ok, errors, warnings = import_schedules_csv(self.db, path)
+        except Exception as e:
+            self._log("❌ 导入失败：%s" % e)
+            return
+        self._log("导入完成：成功 %d 条，错误 %d 条，警告 %d 条" % (ok, len(errors), len(warnings)))
+        for w in warnings[:20]:
+            self._log("  ⚠ " + w)
+        for e in errors[:20]:
+            self._log("  ✗ " + e)
+        if ok:
+            self.on_save()
 
 
 # ============================================================
@@ -1547,6 +2351,17 @@ class SettingsDialog:
         tk.Label(d, text="令牌留空不加密；设置后打开网页需输入一次", fg="#999",
                  font=("微软雅黑", 8)).pack(anchor=tk.W, padx=20)
 
+        # V2.1: 到点容差（超出即记为"漏打"，不再静默丢弃）
+        tol_row = tk.Frame(d)
+        tol_row.pack(anchor=tk.W, padx=20, pady=(8, 2))
+        tk.Label(tol_row, text="漏打容差:", font=("微软雅黑", 10)).pack(side=tk.LEFT)
+        self._tolerance_var = tk.StringVar(
+            value=str(self.settings.get("missed_tolerance_sec", 60)))
+        tk.Entry(tol_row, textvariable=self._tolerance_var, width=7,
+                 font=("微软雅黑", 10), justify=tk.CENTER).pack(side=tk.LEFT, padx=6)
+        tk.Label(tol_row, text="秒（到点后超过此时长记为漏打）", fg="#999",
+                 font=("微软雅黑", 8)).pack(side=tk.LEFT)
+
         tk.Label(d, text="", font=("微软雅黑", 10)).pack(pady=10)
 
         tk.Button(d, text="保存设置", font=("微软雅黑", 10), width=12,
@@ -1564,8 +2379,25 @@ class SettingsDialog:
         except ValueError:
             self.settings["web_port"] = 8787
         self.settings["web_token"] = self._web_token_var.get().strip()
+        try:
+            self.settings["missed_tolerance_sec"] = max(
+                5, min(3600, int(self._tolerance_var.get() or 60)))
+        except ValueError:
+            self.settings["missed_tolerance_sec"] = 60
         self.saved = True
         self._save_settings()
+
+        # V2.1: 启用远程控制但没设令牌时，明确告知风险（不强制阻止，尊重用户选择）
+        if self.settings["web_enabled"] and not self.settings["web_token"]:
+            if not messagebox.askyesno(
+                    "安全提示",
+                    "你启用了「局域网网页远程控制」但没有设置访问令牌。\n\n"
+                    "这意味着同一局域网内的任何设备（手机、电脑）打开网页\n"
+                    "都能添加/删除打铃任务、立即打铃。\n\n"
+                    "建议设置一个访问令牌。是否仍然继续保存？",
+                    parent=self.dialog):
+                self.saved = False
+                return
 
         # 设置开机自启
         if self.settings["auto_start"]:
@@ -1638,10 +2470,16 @@ def main():
     app = BellApp(db, player, scheduler)
     app.run()
 
-    # 关闭
-    app._stop_web_server()
+    # 关闭（V2.1: 托盘"退出"也走这里，不再 os._exit 硬杀，避免 WAL 残留）
+    try:
+        app._stop_web_server()
+    except Exception:
+        pass
     scheduler.stop()
-    db.close()
+    try:
+        db.close()
+    except Exception:
+        pass
     logger.info("程序退出")
 
 
